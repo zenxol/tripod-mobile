@@ -1,0 +1,92 @@
+# Compiles the iOS app on a GitHub-hosted Mac WITHOUT code signing.
+# The result proves the project compiles; it is NOT installable on an iPhone as-is
+# (iOS only installs signed apps). Signing/sideloading is a separate, later step.
+name: iOS build (unsigned)
+
+on:
+  workflow_dispatch: # manual only: macOS minutes count 10x on private repos
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    runs-on: macos-26 # Apple silicon; default Xcode 26.6 (Expo SDK 58 needs Xcode >= 26.4)
+    timeout-minutes: 60
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Check Xcode version
+        run: |
+          xcodebuild -version
+          version=$(xcodebuild -version | head -1 | awk '{print $2}')
+          major=${version%%.*}; minor=$(echo "$version" | cut -d. -f2)
+          if [ "$major" -lt 26 ] || { [ "$major" -eq 26 ] && [ "${minor:-0}" -lt 4 ]; }; then
+            echo "::error::Expo SDK 58 requires Xcode 26.4 or newer, runner has $version"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Generate native iOS project (expo prebuild)
+        run: npx expo prebuild --platform ios --clean --no-install
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install
+
+      - name: Compile with Xcode (no code signing)
+        run: |
+          set -o pipefail
+          WORKSPACE=$(find ios -maxdepth 1 -name '*.xcworkspace' | head -1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          echo "Workspace: $WORKSPACE  Scheme: $SCHEME"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log | grep -E 'error:|warning: .*deprecated|\*\* BUILD' || true
+          grep -q '\*\* BUILD SUCCEEDED \*\*' xcodebuild.log
+
+      - name: Package unsigned app
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          echo "Built: $APP"
+          mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/
+          (cd dist && zip -qry Tripod-unsigned.ipa Payload && rm -rf Payload)
+          cat > dist/README.txt <<'EOF'
+          UNSIGNED build from GitHub Actions. It proves the app compiles for iOS devices.
+          It cannot be installed on an iPhone as-is: iOS only installs apps signed with a
+          certificate/provisioning profile. Signing/sideloading is handled in a later step.
+          EOF
+          ls -la dist
+
+      - name: Upload unsigned build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tripod-ios-unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore

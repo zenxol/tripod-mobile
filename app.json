@@ -1,13 +1,15 @@
 {
   "expo": {
-    "name": "tripod-mobile",
+    "name": "Tripod",
     "slug": "tripod-mobile",
+    "scheme": "tripod",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.zenxol.tripod"
     },
     "android": {
       "adaptiveIcon": {
