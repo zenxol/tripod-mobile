@@ -4,6 +4,7 @@ import { Alert, Linking, Pressable, StyleSheet, Text, View } from 'react-native'
 
 import {
   type CameraStateChangeEvent,
+  type CaptureSettings,
   type RecordingFinishedEvent,
   TripodCameraView,
   addRecordingFinishedListener,
@@ -22,6 +23,7 @@ export default function App() {
   const [mode, setMode] = useState<Mode>('home');
   const [busy, setBusy] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<CameraStateChangeEvent>({ state: 'starting' });
+  const [captureSettings, setCaptureSettings] = useState<CaptureSettings | null>(null);
   const [phase, setPhase] = useState<RecordingPhase>('idle');
   const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -113,6 +115,20 @@ export default function App() {
     }
   };
 
+  const onCameraEvent = (event: CameraStateChangeEvent) => {
+    setCameraStatus(event);
+    const next = event.settings;
+    if (next) {
+      setCaptureSettings((previous) => {
+        const changed = !previous || formatSettings(previous) !== formatSettings(next) || previous.note !== next.note;
+        if (changed) {
+          console.log(`[camera] ${formatSettings(next)}${next.note ? ` (${next.note})` : ''}`);
+        }
+        return changed ? next : previous;
+      });
+    }
+  };
+
   const onStopCamera = () => {
     // Unmounting the camera view releases the camera; native code finishes and saves
     // any recording first, and the result still arrives through onRecordingFinished.
@@ -126,7 +142,7 @@ export default function App() {
       <View style={styles.cameraContainer}>
         <TripodCameraView
           style={StyleSheet.absoluteFill}
-          onCameraStateChange={(e) => setCameraStatus(e.nativeEvent)}
+          onCameraStateChange={(e) => onCameraEvent(e.nativeEvent)}
         />
         <View style={styles.cameraTopBar} pointerEvents="none">
           {isRecording ? (
@@ -140,6 +156,12 @@ export default function App() {
           {isRecording && !cameraReady && (
             <Text style={[styles.cameraStatusText, styles.topBarSpacing]}>
               {describeCameraStatus(cameraStatus)}
+            </Text>
+          )}
+          {captureSettings && (
+            <Text style={[styles.settingsText, styles.topBarSpacing]}>
+              {formatSettings(captureSettings)}
+              {captureSettings.note ? `\n${captureSettings.note}` : ''}
             </Text>
           )}
         </View>
@@ -247,6 +269,8 @@ function describeRecordingFinished(event: RecordingFinishedEvent): Banner {
   const details = [
     formatDuration(event.durationSeconds),
     `${event.width}×${event.height}`,
+    `${Math.round(event.frameRate)} fps`,
+    event.codec.toUpperCase(),
     `${(event.sizeBytes / 1_048_576).toFixed(1)} MB`,
   ].join(' · ');
   const reason =
@@ -265,6 +289,10 @@ function describeCameraStatus({ state, message }: CameraStateChangeEvent): strin
     case 'error':
       return `Camera error: ${message ?? 'unknown'}`;
   }
+}
+
+function formatSettings(s: CaptureSettings): string {
+  return `${s.width}×${s.height} · ${Math.round(s.fps)} fps · ${s.codec.toUpperCase()}`;
 }
 
 function formatElapsed(ms: number): string {
@@ -368,6 +396,17 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     overflow: 'hidden',
     textAlign: 'center',
+  },
+  settingsText: {
+    color: '#fff',
+    fontSize: 13,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    overflow: 'hidden',
+    textAlign: 'center',
+    fontVariant: ['tabular-nums'],
   },
   recIndicator: {
     flexDirection: 'row',

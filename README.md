@@ -72,14 +72,18 @@ A local Expo module (Expo Modules API, Swift). Expo autolinking picks up every f
 | `ios/TripodCameraModule.swift` | JS module `TripodCamera`: permission functions, `startRecording`, `stopRecording`, event `onRecordingFinished`, and the native view (prop `active`, event `onCameraStateChange`) |
 | `ios/TripodCameraView.swift` | `ExpoView` hosting an `AVCaptureVideoPreviewLayer`; attaches to the shared session while on screen and keeps the screen awake |
 | `ios/CameraSessionController.swift` | The app's single camera (`CameraSessionController.shared`): one `AVCaptureSession` (rear wide camera) plus an `AVCaptureMovieFileOutput`, all on a private serial queue |
+| `ios/CaptureConfiguration.swift` | Capture quality policy: camera, rotation, format/frame-rate targets and fallbacks, codec preference |
 | `index.ts` | TypeScript wrapper. Uses `requireOptionalNativeModule`, so Expo Go and web show a message instead of crashing |
 
 Camera frames go directly from the session to the preview layer and the movie file; nothing crosses the JavaScript bridge. The camera permission text is `ios.infoPlist.NSCameraUsageDescription` in `app.json`.
 
 **Recording (Task 3B milestone; Task 4 replaces it with `AVCaptureVideoDataOutput` + `AVAssetWriter` segments):**
-- H.264, portrait, video only (no audio, so no microphone permission). Resolution comes from the `.high` session preset.
+- **Format:** picked from the camera's actual formats. It tries 1080p60, then 1080p30, then 720p60, then 720p30, then the default `.high` preset. Only 8-bit SDR formats are used; it prefers non-binned formats and the widest field of view. The frame rate is locked (min = max), and drops to 30 fps while the phone reports serious thermal pressure.
+- **Same settings everywhere:** the format is set on the device, so the preview and the recording match. Stabilization is off and both use the same rotation, so the recorded framing equals the preview.
+- **Codec:** HEVC when the output supports it, else H.264. Portrait, video only (no audio, so no microphone permission).
+- **Reporting:** the actual settings (read back from the device) arrive with the `running` camera state (`settings`), appear under LIVE, and go to the JS console. The saved file's resolution, frame rate and codec are read from the file itself. Native logs use subsystem `com.zenxol.tripod`, category `camera`.
 - Written to `tmp/recording-in-progress/`, checked (readable, has video, duration > 0), then moved to `Documents/Recordings/recording_YYYYMMDD_HHMMSS_<6 hex>.mov`. Leftovers in the in-progress folder are deleted on launch.
-- `stopRecording()` resolves with `{ uri, fileName, durationSeconds, width, height, frameRate, sizeBytes, startedAt, endedBy, note? }`. `onRecordingFinished` fires for every ending, including interruptions, low storage (< 200 MB while recording) and Stop Camera.
+- `stopRecording()` resolves with `{ uri, fileName, durationSeconds, width, height, frameRate, codec, sizeBytes, startedAt, endedBy, note? }`. `onRecordingFinished` fires for every ending, including interruptions, low storage (< 200 MB while recording) and Stop Camera.
 - Recording refuses to start below 500 MB free. `Documents` is visible in the Files app under **On My iPhone → Tripod** (`UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace`).
 
 Because of this module, **Expo Go can no longer show the camera**. The home screen still loads there, but Start Camera explains that the iOS build is required.

@@ -63,9 +63,9 @@ final class TripodCameraView: ExpoView {
     UIApplication.shared.isIdleTimerDisabled = shouldAttach
 
     if shouldAttach {
-      camera.attach(clientID) { [weak self] state, message in
+      camera.attach(clientID) { [weak self] payload in
         DispatchQueue.main.async { [weak self] in
-          self?.handleCameraState(state, message)
+          self?.handleCameraEvent(payload)
         }
       }
     } else {
@@ -73,26 +73,12 @@ final class TripodCameraView: ExpoView {
     }
   }
 
-  private func handleCameraState(_ state: CameraState, _ message: String?) {
-    if state == .running {
-      lockPreviewToPortrait()
-    }
-    var payload: [String: Any] = ["state": state.rawValue]
-    if let message {
-      payload["message"] = message
+  /// `payload` is `{ state, message?, settings? }` from CameraSessionController.
+  private func handleCameraEvent(_ payload: [String: Any]) {
+    if payload["state"] as? String == CameraState.running.rawValue, let connection = previewLayer.connection {
+      // Same rotation as the recording connection, so preview and file always match.
+      CaptureConfiguration.applyRotation(to: connection)
     }
     onCameraStateChange(payload)
-  }
-
-  /// The app is portrait-only, so the preview is always shown upright in portrait.
-  private func lockPreviewToPortrait() {
-    guard let connection = previewLayer.connection else { return }
-    if #available(iOS 17.0, *) {
-      if connection.isVideoRotationAngleSupported(90) {
-        connection.videoRotationAngle = 90
-      }
-    } else if connection.isVideoOrientationSupported {
-      connection.videoOrientation = .portrait
-    }
   }
 }

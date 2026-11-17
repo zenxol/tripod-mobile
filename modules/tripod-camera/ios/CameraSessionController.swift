@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import os
 
 /// States reported to JavaScript through the view's `onCameraStateChange` event.
 enum CameraState: String {
@@ -32,8 +33,14 @@ private enum CameraSetupError: LocalizedError {
 }
 
 /**
- The app's single camera: one AVCaptureSession (rear wide camera) with a preview and an
+ The app's single camera: one AVCaptureSession with a preview and an
  AVCaptureMovieFileOutput for ordinary start/stop recording.
+
+ Quality: the camera format, frame rate and codec come from `CaptureConfiguration`
+ (1080p60 when supported, with fallbacks; HEVC, else H.264). The format is set on the
+ device itself, so the preview and the recording always use the same capture settings.
+ The frame rate is locked, and lowered to 30 fps while the phone is under serious thermal
+ pressure.
 
  Threading: every piece of mutable state is touched only on `queue` (AVCaptureSession's
  `startRunning()` blocks, so it must never run on the main thread). That is what makes the
@@ -48,14 +55,17 @@ private enum CameraSetupError: LocalizedError {
  (readable, has video, duration > 0), then moved to `Documents/Recordings/`. Leftovers in
  the in-progress folder (for example after a crash) are deleted on launch.
 
- NOTE: AVCaptureMovieFileOutput is the Task 3B milestone only. The rolling buffer (Task 4)
- needs AVCaptureVideoDataOutput + AVAssetWriter segments and will replace it.
+ NOTE: AVCaptureMovieFileOutput is a milestone only. The rolling buffer (Task 4) needs
+ AVCaptureVideoDataOutput + AVAssetWriter segments and will replace it.
  */
 final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDelegate, @unchecked Sendable {
   static let shared = CameraSessionController()
 
   /// Shared with the preview layers. Attaching a preview layer from the main thread is safe.
   let session = AVCaptureSession()
+
+  /// Visible in Console.app (subsystem com.zenxol.tripod, category camera).
+  private static let log = Logger(subsystem: "com.zenxol.tripod", category: "camera")
 
   /// Refuse to start a recording below this much free space.
   private static let minFreeBytesToStart: Int64 = 500 * 1024 * 1024
@@ -66,10 +76,18 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
   private let movieOutput = AVCaptureMovieFileOutput()
   private var isConfigured = false
   private var isMovieOutputReady = false
-  private var clients: [UUID: (CameraState, String?) -> Void] = [:]
+  private var clients: [UUID: ([String: Any]) -> Void] = [:]
   private var observers: [NSObjectProtocol] = []
   private var active: ActiveRecording?
   private var recordingFinishedHandler: (([String: Any]) -> Void)?
+
+  // Capture settings (session queue only).
+  private var videoDevice: AVCaptureDevice?
+  private var formatSelection: FormatSelection?
+  private var codecName = "default"
+  private var setupNote: String?
+  private var isThermallyThrottled = false
+  private var pressureObservation: NSKeyValueObservation?
 
   private struct ActiveRecording {
     let fileName: String
@@ -103,7 +121,10 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       let rawReason = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
       let reason = rawReason.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
       let message = CameraSessionController.describe(reason)
-      self.queue.async { self.emit(.interrupted, message) }
+      self.queue.async {
+        Self.log.notice("Camera interrupted: \(message, privacy: .public)")
+        self.emit(.interrupted, message)
+      }
     })
 
     observers.append(center.addObserver(
@@ -112,6 +133,8 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       guard let self else { return }
       self.queue.async {
         guard !self.clients.isEmpty, self.session.isRunning else { return }
+        Self.log.notice("Camera interruption ended")
+        self.enforceCaptureSettings()
         self.emit(.running, nil)
       }
     })
@@ -127,16 +150,17 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
 
   // MARK: - Preview clients
 
-  /// Registers a preview view and starts the session if needed. `onStateChange` is called on the session queue.
-  func attach(_ id: UUID, onStateChange: @escaping (CameraState, String?) -> Void) {
+  /// Registers a preview view and starts the session if needed. `onEvent` receives
+  /// `{ state, message?, settings? }` payloads on the session queue.
+  func attach(_ id: UUID, onEvent: @escaping ([String: Any]) -> Void) {
     queue.async { [self] in
-      clients[id] = onStateChange
+      clients[id] = onEvent
       if session.isRunning {
         // Already running for another client: tell the new one the current state.
         if session.isInterrupted {
-          onStateChange(.interrupted, "The camera is paused.")
+          onEvent(payload(.interrupted, "The camera is paused."))
         } else {
-          onStateChange(.running, nil)
+          onEvent(payload(.running, nil))
         }
       } else {
         startIfNeeded()
@@ -197,6 +221,8 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
           code: "ERR_FILE", message: "Could not create the recordings folder: \(error.localizedDescription)")))
       }
 
+      let settingsSummary = makeSettings()?.summary ?? "unknown settings"
+      Self.log.info("Recording \(fileName, privacy: .public) with \(settingsSummary, privacy: .public)")
       active = ActiveRecording(
         fileName: fileName, tempURL: tempURL, finalURL: finalURL, startCompletion: completion)
       movieOutput.startRecording(to: tempURL, recordingDelegate: self)
@@ -275,6 +301,7 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
         try configureSession()
         isConfigured = true
       } catch {
+        Self.log.error("Camera setup failed: \(error.localizedDescription, privacy: .public)")
         emit(.error, error.localizedDescription)
         return
       }
@@ -283,6 +310,8 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
     emit(.starting, nil)
     session.startRunning() // blocking; this is why we are on `queue`
     if session.isRunning {
+      enforceCaptureSettings()
+      Self.log.info("Camera running: \(self.makeSettings()?.summary ?? "unknown", privacy: .public)")
       emit(.running, nil)
     } else {
       // A runtimeErrorNotification with the specific reason usually follows.
@@ -304,6 +333,7 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
     }
     if session.isRunning {
       session.stopRunning()
+      Self.log.info("Camera stopped")
     }
   }
 
@@ -311,11 +341,9 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
     session.beginConfiguration()
     defer { session.commitConfiguration() }
 
-    if session.canSetSessionPreset(.high) {
-      session.sessionPreset = .high
-    }
-
-    guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+    guard let device = AVCaptureDevice.default(
+      CaptureConfiguration.deviceType, for: .video, position: CaptureConfiguration.devicePosition)
+    else {
       throw CameraSetupError.noRearCamera
     }
     let input = try AVCaptureDeviceInput(device: device)
@@ -323,20 +351,107 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       throw CameraSetupError.cannotAddInput
     }
     session.addInput(input)
+    videoDevice = device
 
     // Recording is optional: if the output can't be added, the preview still works and
     // startRecording() reports ERR_RECORDING_UNAVAILABLE.
     if session.canAddOutput(movieOutput) {
       session.addOutput(movieOutput)
       movieOutput.minFreeDiskSpaceLimit = Self.minFreeBytesWhileRecording
-      if let connection = movieOutput.connection(with: .video) {
-        // H.264 plays everywhere (including Windows) without extra codecs.
-        if movieOutput.availableVideoCodecTypes.contains(.h264) {
-          movieOutput.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.h264], for: connection)
-        }
-        Self.setPortrait(connection)
-      }
       isMovieOutputReady = true
+    } else {
+      Self.log.error("Movie file output could not be added; recording disabled")
+    }
+
+    // The format is set after the input is added (adding an input resets frame durations).
+    // Setting activeFormat switches the session preset to .inputPriority, so the preview
+    // and the recording both use exactly this format.
+    if let selection = CaptureConfiguration.selectFormat(for: device) {
+      do {
+        try device.lockForConfiguration()
+        device.activeFormat = selection.format
+        Self.setFrameDuration(selection.target.fps, on: device)
+        device.unlockForConfiguration()
+        formatSelection = selection
+        setupNote = selection.fallbackNote
+      } catch {
+        setupNote = "Could not select \(selection.target.label) (\(error.localizedDescription)); using the default camera format."
+        if session.canSetSessionPreset(.high) { session.sessionPreset = .high }
+      }
+    } else {
+      setupNote = "No supported 1080p or 720p format; using the default camera format."
+      if session.canSetSessionPreset(.high) { session.sessionPreset = .high }
+    }
+
+    // Codec and connection settings depend on the active format, so they come last.
+    if isMovieOutputReady, let connection = movieOutput.connection(with: .video) {
+      let codec = CaptureConfiguration.preferredCodec(from: movieOutput.availableVideoCodecTypes)
+      if let codec {
+        movieOutput.setOutputSettings([AVVideoCodecKey: codec], for: connection)
+      }
+      codecName = CaptureConfiguration.codecName(codec)
+      // Stabilization crops and delays the recording relative to the preview; on a tripod it
+      // adds nothing, and turning it off keeps the recorded framing identical to the preview.
+      if connection.isVideoStabilizationSupported {
+        connection.preferredVideoStabilizationMode = .off
+      }
+      CaptureConfiguration.applyRotation(to: connection)
+    }
+
+    pressureObservation = device.observe(\.systemPressureState, options: [.new]) { [weak self] device, _ in
+      let level = device.systemPressureState.level
+      self?.queue.async { self?.handleSystemPressure(level) }
+    }
+
+    if let note = setupNote {
+      Self.log.notice("Capture fallback: \(note, privacy: .public)")
+    }
+  }
+
+  /// Re-applies the selected format and frame rate if anything reset them (session start,
+  /// interruption end, media services reset). Cheap when nothing changed.
+  private func enforceCaptureSettings() {
+    guard let device = videoDevice, let selection = formatSelection else { return }
+    let wantedFps = isThermallyThrottled
+      ? min(CaptureConfiguration.reducedFps, selection.target.fps)
+      : selection.target.fps
+    let formatChanged = device.activeFormat != selection.format
+    let fpsChanged = abs(Self.currentFps(device) - wantedFps) > 0.5
+    guard formatChanged || fpsChanged else { return }
+
+    Self.log.notice("Re-applying capture settings (format changed: \(formatChanged), fps changed: \(fpsChanged))")
+    do {
+      try device.lockForConfiguration()
+      if formatChanged {
+        device.activeFormat = selection.format
+      }
+      Self.setFrameDuration(wantedFps, on: device)
+      device.unlockForConfiguration()
+    } catch {
+      Self.log.error("Could not re-apply capture settings: \(error.localizedDescription, privacy: .public)")
+    }
+  }
+
+  private func handleSystemPressure(_ level: AVCaptureDevice.SystemPressureState.Level) {
+    guard let device = videoDevice, let selection = formatSelection else { return }
+    let shouldThrottle = level == .serious || level == .critical
+    guard shouldThrottle != isThermallyThrottled else { return }
+
+    let fps = shouldThrottle
+      ? min(CaptureConfiguration.reducedFps, selection.target.fps)
+      : selection.target.fps
+    do {
+      try device.lockForConfiguration()
+      Self.setFrameDuration(fps, on: device)
+      device.unlockForConfiguration()
+    } catch {
+      Self.log.error("Could not change frame rate for thermal pressure: \(error.localizedDescription, privacy: .public)")
+      return
+    }
+    isThermallyThrottled = shouldThrottle
+    Self.log.notice("System pressure \(level.rawValue, privacy: .public): frame rate now \(fps) fps")
+    if session.isRunning && !session.isInterrupted {
+      emit(.running, nil)
     }
   }
 
@@ -403,23 +518,59 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
     case .success(let info):
       event = info
       event["ok"] = true
+      let summary = "\(info["width"] ?? "?")x\(info["height"] ?? "?") \(info["frameRate"] ?? "?") fps \(info["codec"] ?? "?"), \(info["durationSeconds"] ?? "?") s"
+      Self.log.info("Saved \(recording.fileName, privacy: .public): \(summary, privacy: .public), ended by \(endedBy, privacy: .public)")
     case .failure(let error):
       event = ["ok": false, "code": error.code, "message": error.message, "endedBy": endedBy]
+      Self.log.error("Recording \(recording.fileName, privacy: .public) failed: \(error.code, privacy: .public) \(error.message, privacy: .public)")
     }
     recordingFinishedHandler?(event)
   }
 
   private func handleRuntimeError(_ error: AVError?) {
-    emit(.error, error?.localizedDescription ?? "The camera stopped because of an unknown error.")
-    // After a media services reset the session must be restarted; other errors are left
-    // to the user (leave and reopen the camera) to avoid a restart loop.
+    let message = error?.localizedDescription ?? "The camera stopped because of an unknown error."
+    Self.log.error("Camera runtime error: \(message, privacy: .public)")
+    emit(.error, message)
+    // After a media services reset the session must be restarted (startIfNeeded re-applies
+    // the capture settings); other errors are left to the user (leave and reopen the camera)
+    // to avoid a restart loop.
     if error?.code == .mediaServicesWereReset {
       startIfNeeded()
     }
   }
 
   private func emit(_ state: CameraState, _ message: String?) {
-    clients.values.forEach { $0(state, message) }
+    let event = payload(state, message)
+    clients.values.forEach { $0(event) }
+  }
+
+  private func payload(_ state: CameraState, _ message: String?) -> [String: Any] {
+    var result: [String: Any] = ["state": state.rawValue]
+    if let message {
+      result["message"] = message
+    }
+    if let settings = makeSettings() {
+      result["settings"] = settings.dictionary()
+    }
+    return result
+  }
+
+  /// Reads what the device is actually doing right now.
+  private func makeSettings() -> CaptureSettings? {
+    guard let device = videoDevice else { return nil }
+    let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+    let fps = Self.currentFps(device)
+    let notes = [
+      setupNote,
+      isThermallyThrottled ? "Reduced to \(Int(CaptureConfiguration.reducedFps)) fps because the phone is hot." : nil,
+    ].compactMap { $0 }
+    return CaptureSettings(
+      width: Int(dimensions.width),
+      height: Int(dimensions.height),
+      fps: fps,
+      targetFps: formatSelection?.target.fps ?? fps,
+      codec: codecName,
+      note: notes.isEmpty ? nil : notes.joined(separator: " "))
   }
 
   // MARK: - Helpers
@@ -431,6 +582,20 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
 
   private static var inProgressDirectory: URL {
     FileManager.default.temporaryDirectory.appendingPathComponent("recording-in-progress", isDirectory: true)
+  }
+
+  /// Locks the frame rate (min = max frame duration). Caller must hold the device lock.
+  private static func setFrameDuration(_ fps: Double, on device: AVCaptureDevice) {
+    guard CaptureConfiguration.supports(device.activeFormat, fps: fps) else { return }
+    let duration = CMTime(value: 1, timescale: CMTimeScale(fps.rounded()))
+    device.activeVideoMinFrameDuration = duration
+    device.activeVideoMaxFrameDuration = duration
+  }
+
+  private static func currentFps(_ device: AVCaptureDevice) -> Double {
+    let seconds = device.activeVideoMinFrameDuration.seconds
+    guard seconds.isFinite, seconds > 0 else { return 0 }
+    return (1 / seconds * 100).rounded() / 100
   }
 
   /// recording_YYYYMMDD_HHMMSS_<6 hex>.mov: wall-clock time plus a random suffix, never overwrites.
@@ -452,16 +617,6 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
     return values?.volumeAvailableCapacityForImportantUsage
   }
 
-  private static func setPortrait(_ connection: AVCaptureConnection) {
-    if #available(iOS 17.0, *) {
-      if connection.isVideoRotationAngleSupported(90) {
-        connection.videoRotationAngle = 90
-      }
-    } else if connection.isVideoOrientationSupported {
-      connection.videoOrientation = .portrait
-    }
-  }
-
   /// Opens the finished file and reads its metadata. Fails if it is unreadable or has no video.
   private static func inspectRecording(at url: URL) async -> Result<[String: Any], RecordingError> {
     do {
@@ -471,6 +626,10 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
         return .failure(RecordingError(code: "ERR_VERIFY_FAILED", message: "The recorded file contains no video."))
       }
       let (naturalSize, transform, frameRate) = try await track.load(.naturalSize, .preferredTransform, .nominalFrameRate)
+      let formatDescriptions = try await track.load(.formatDescriptions)
+      let codec = formatDescriptions.first.map {
+        CaptureConfiguration.codecName(fourCC: CMFormatDescriptionGetMediaSubType($0))
+      } ?? "unknown"
       let displaySize = naturalSize.applying(transform)
       let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
       let sizeBytes = (attributes?[.size] as? NSNumber)?.doubleValue ?? 0
@@ -478,7 +637,8 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
         "durationSeconds": duration.seconds,
         "width": Int(abs(displaySize.width).rounded()),
         "height": Int(abs(displaySize.height).rounded()),
-        "frameRate": Double(frameRate),
+        "frameRate": (Double(frameRate) * 100).rounded() / 100,
+        "codec": codec,
         "sizeBytes": sizeBytes,
       ])
     } catch {

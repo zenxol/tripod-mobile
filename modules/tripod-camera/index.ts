@@ -6,10 +6,27 @@ export type CameraPermissionStatus = 'granted' | 'denied' | 'undetermined';
 
 export type CameraState = 'starting' | 'running' | 'interrupted' | 'error';
 
+/** What the camera is actually doing (read back from the device, not what was requested). */
+export type CaptureSettings = {
+  /** Camera format size, sensor orientation (e.g. 1920×1080; recordings are rotated to portrait). */
+  width: number;
+  height: number;
+  /** Frame rate currently locked on the device. */
+  fps: number;
+  /** Frame rate chosen at setup; `fps` is lower while the phone is too hot. */
+  targetFps: number;
+  /** Recording codec: 'hevc', 'h264', or 'default' if neither could be selected. */
+  codec: string;
+  /** Explains any fallback (e.g. 60 fps unsupported) or thermal frame-rate reduction. */
+  note?: string;
+};
+
 export type CameraStateChangeEvent = {
   state: CameraState;
   /** Human-readable reason, present for `interrupted` and `error`. */
   message?: string;
+  /** Present once the camera has been configured. */
+  settings?: CaptureSettings;
 };
 
 export type TripodCameraViewProps = ViewProps & {
@@ -32,9 +49,13 @@ export type RecordingInfo = {
   uri: string;
   fileName: string;
   durationSeconds: number;
+  /** As displayed (portrait), read from the saved file. */
   width: number;
   height: number;
+  /** Average frame rate of the saved file. */
   frameRate: number;
+  /** Codec read from the saved file: 'hevc', 'h264' or another FourCC. */
+  codec: string;
   sizeBytes: number;
   startedAt: string;
   endedBy: RecordingEndedBy;
