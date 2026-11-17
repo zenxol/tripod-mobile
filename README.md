@@ -1,6 +1,6 @@
 # Tripod Mobile
 
-iPhone version of Tripod (pickleball instant replay). **Current state: a home screen with a placeholder "Start Camera" button.** There's no camera, recording or replay yet.
+iPhone version of Tripod (pickleball instant replay). **Current state: home screen + live rear-camera preview** (native Swift/AVFoundation module in `modules/tripod-camera`). There's no recording or replay yet.
 
 | | |
 |---|---|
@@ -61,20 +61,30 @@ git remote add origin https://github.com/<your-user>/<repo-name>.git
 git push -u origin main
 ```
 
-## Adding Swift native code later
+## Native camera module (`modules/tripod-camera`)
 
-Custom native code uses the Expo Modules API:
-```powershell
-npx create-expo-module@latest --local   # creates modules/<name>/ with ios/*.swift
-```
-`expo prebuild` links local modules into the generated iOS project, so the CI workflow builds them without changes. After this, Expo Go can no longer run the app; a custom build is needed.
+A local Expo module (Expo Modules API, Swift). Expo autolinking picks up every folder in `modules/`, and `expo prebuild` + `pod install` link it into the iOS project, so the CI workflow builds it without changes.
+
+| File | Role |
+|---|---|
+| `expo-module.config.json` | Declares the Apple module class `TripodCameraModule` |
+| `ios/TripodCamera.podspec` | CocoaPods spec (depends on `ExpoModulesCore`, links AVFoundation) |
+| `ios/TripodCameraModule.swift` | JS module `TripodCamera`: `getPermissionStatusAsync`, `requestPermissionAsync`, and the native view (prop `active`, event `onCameraStateChange`) |
+| `ios/TripodCameraView.swift` | `ExpoView` hosting an `AVCaptureVideoPreviewLayer`; starts the session when on screen, stops it when removed |
+| `ios/CameraSessionController.swift` | Owns the `AVCaptureSession` (rear wide camera) on a private serial queue; reports starting/running/interrupted/stopped/error |
+| `index.ts` | TypeScript wrapper. Uses `requireOptionalNativeModule`, so Expo Go and web show a message instead of crashing |
+
+Camera frames go directly from the session to the preview layer; nothing crosses the JavaScript bridge. The camera permission text is `ios.infoPlist.NSCameraUsageDescription` in `app.json`.
+
+Because of this module, **Expo Go can no longer show the camera**. The home screen still loads there, but Start Camera explains that the iOS build is required.
 
 ## Project layout
 
 ```
-App.tsx                         home screen
-app.json                        app config (name, bundle ID, iOS settings)
+App.tsx                         home screen + camera preview + permission-denied state
+app.json                        app config (name, bundle ID, iOS settings, camera permission text)
 index.ts                        entry point
+modules/tripod-camera/          native Swift camera module (see above)
 .github/workflows/ios-build.yml unsigned iOS CI build
 AGENTS.md                       Expo guidance for AI coding agents (from the template)
 ```
