@@ -5,17 +5,19 @@ import UIKit
 /**
  Live rear-camera preview shown inside React Native.
 
- Frames go straight from AVCaptureSession to AVCaptureVideoPreviewLayer on the GPU;
- nothing crosses the JavaScript bridge. The session runs only while the view is
- both `active` (prop from JS) and attached to a window, so unmounting the view in JS
- always stops the camera.
+ Frames go straight from the shared AVCaptureSession to AVCaptureVideoPreviewLayer on the
+ GPU; nothing crosses the JavaScript bridge. The view attaches to the session only while it
+ is both `active` (prop from JS) and in a window, so unmounting it in JS releases the camera
+ (any recording in progress is finished and saved first, by the controller).
  */
 final class TripodCameraView: ExpoView {
   let onCameraStateChange = EventDispatcher()
 
-  private let camera = CameraSessionController()
+  private let camera = CameraSessionController.shared
+  private let clientID = UUID()
   private let previewLayer = AVCaptureVideoPreviewLayer()
   private var isActive = true
+  private var isAttached = false
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -25,24 +27,10 @@ final class TripodCameraView: ExpoView {
     previewLayer.videoGravity = .resizeAspectFill
     previewLayer.session = camera.session
     layer.addSublayer(previewLayer)
-
-    camera.onStateChange = { [weak self] state, message in
-      DispatchQueue.main.async { [weak self] in
-        guard let self else { return }
-        if state == .running {
-          self.lockPreviewToPortrait()
-        }
-        var payload: [String: Any] = ["state": state.rawValue]
-        if let message {
-          payload["message"] = message
-        }
-        self.onCameraStateChange(payload)
-      }
-    }
   }
 
   deinit {
-    camera.stop()
+    camera.detach(clientID)
   }
 
   override func layoutSubviews() {
@@ -56,21 +44,44 @@ final class TripodCameraView: ExpoView {
 
   override func didMoveToWindow() {
     super.didMoveToWindow()
-    updateSessionState()
+    updateAttachment()
   }
 
   func setActive(_ active: Bool) {
     guard active != isActive else { return }
     isActive = active
-    updateSessionState()
+    updateAttachment()
   }
 
-  private func updateSessionState() {
-    if isActive && window != nil {
-      camera.start()
+  private func updateAttachment() {
+    let shouldAttach = isActive && window != nil
+    guard shouldAttach != isAttached else { return }
+    isAttached = shouldAttach
+
+    // Keep the phone from auto-locking while the camera is on screen; auto-lock would
+    // interrupt the session and end a recording.
+    UIApplication.shared.isIdleTimerDisabled = shouldAttach
+
+    if shouldAttach {
+      camera.attach(clientID) { [weak self] state, message in
+        DispatchQueue.main.async { [weak self] in
+          self?.handleCameraState(state, message)
+        }
+      }
     } else {
-      camera.stop()
+      camera.detach(clientID)
     }
+  }
+
+  private func handleCameraState(_ state: CameraState, _ message: String?) {
+    if state == .running {
+      lockPreviewToPortrait()
+    }
+    var payload: [String: Any] = ["state": state.rawValue]
+    if let message {
+      payload["message"] = message
+    }
+    onCameraStateChange(payload)
   }
 
   /// The app is portrait-only, so the preview is always shown upright in portrait.

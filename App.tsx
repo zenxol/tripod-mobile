@@ -1,21 +1,55 @@
 import { StatusBar } from 'expo-status-bar';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Alert, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import {
   type CameraStateChangeEvent,
+  type RecordingFinishedEvent,
   TripodCameraView,
+  addRecordingFinishedListener,
   getCameraPermissionStatusAsync,
   isCameraModuleAvailable,
   requestCameraPermissionAsync,
+  startRecording,
+  stopRecording,
 } from './modules/tripod-camera';
 
 type Mode = 'home' | 'denied' | 'camera';
+type RecordingPhase = 'idle' | 'starting' | 'recording' | 'stopping';
+type Banner = { kind: 'success' | 'error'; text: string };
 
 export default function App() {
   const [mode, setMode] = useState<Mode>('home');
   const [busy, setBusy] = useState(false);
   const [cameraStatus, setCameraStatus] = useState<CameraStateChangeEvent>({ state: 'starting' });
+  const [phase, setPhase] = useState<RecordingPhase>('idle');
+  const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [banner, setBanner] = useState<Banner | null>(null);
+  // Guards against double taps before React re-renders the disabled button.
+  const recordingRequest = useRef(false);
+
+  // Every recording ending (requested or not) arrives here: the single source of truth for UI state.
+  useEffect(() => {
+    const subscription = addRecordingFinishedListener((event) => {
+      recordingRequest.current = false;
+      setPhase('idle');
+      setRecordingStartedAt(null);
+      setBanner(describeRecordingFinished(event));
+    });
+    return () => subscription?.remove();
+  }, []);
+
+  // Recording duration timer.
+  useEffect(() => {
+    if (phase !== 'recording' || recordingStartedAt == null) {
+      setElapsedMs(0);
+      return;
+    }
+    setElapsedMs(Date.now() - recordingStartedAt);
+    const timer = setInterval(() => setElapsedMs(Date.now() - recordingStartedAt), 250);
+    return () => clearInterval(timer);
+  }, [phase, recordingStartedAt]);
 
   const onStartCamera = async () => {
     if (!isCameraModuleAvailable || !TripodCameraView) {
@@ -39,30 +73,107 @@ export default function App() {
         setMode('denied');
       }
     } catch (e) {
-      Alert.alert('Camera error', e instanceof Error ? e.message : String(e));
+      Alert.alert('Camera error', errorMessage(e));
     } finally {
       setBusy(false);
     }
   };
 
+  const onStartRecording = async () => {
+    if (recordingRequest.current || phase !== 'idle') return;
+    recordingRequest.current = true;
+    setBanner(null);
+    setPhase('starting');
+    try {
+      await startRecording();
+      setRecordingStartedAt(Date.now());
+      setPhase('recording');
+    } catch (e) {
+      setPhase('idle');
+      setBanner({ kind: 'error', text: `Could not start recording: ${errorMessage(e)}` });
+    } finally {
+      recordingRequest.current = false;
+    }
+  };
+
+  const onStopRecording = async () => {
+    if (phase !== 'recording') return;
+    setPhase('stopping');
+    try {
+      // onRecordingFinished reports the same result; applying it here too means the UI
+      // never stays stuck in "Saving…" if the event were missed.
+      const info = await stopRecording();
+      setPhase('idle');
+      setRecordingStartedAt(null);
+      setBanner(describeRecordingFinished({ ok: true, ...info }));
+    } catch (e) {
+      setPhase('idle');
+      setRecordingStartedAt(null);
+      setBanner({ kind: 'error', text: `Could not stop recording: ${errorMessage(e)}` });
+    }
+  };
+
+  const onStopCamera = () => {
+    // Unmounting the camera view releases the camera; native code finishes and saves
+    // any recording first, and the result still arrives through onRecordingFinished.
+    setMode('home');
+  };
+
   if (mode === 'camera' && TripodCameraView) {
+    const cameraReady = cameraStatus.state === 'running';
+    const isRecording = phase === 'recording' || phase === 'stopping';
     return (
       <View style={styles.cameraContainer}>
-        {/* Unmounting this view (Stop Camera) stops the native capture session. */}
         <TripodCameraView
           style={StyleSheet.absoluteFill}
           onCameraStateChange={(e) => setCameraStatus(e.nativeEvent)}
         />
         <View style={styles.cameraTopBar} pointerEvents="none">
-          <Text style={styles.cameraStatusText}>{describeCameraStatus(cameraStatus)}</Text>
+          {isRecording ? (
+            <View style={styles.recIndicator}>
+              <View style={styles.recDot} />
+              <Text style={styles.recText}>REC {formatElapsed(elapsedMs)}</Text>
+            </View>
+          ) : (
+            <Text style={styles.cameraStatusText}>{describeCameraStatus(cameraStatus)}</Text>
+          )}
+          {isRecording && !cameraReady && (
+            <Text style={[styles.cameraStatusText, styles.topBarSpacing]}>
+              {describeCameraStatus(cameraStatus)}
+            </Text>
+          )}
         </View>
         <View style={styles.cameraBottomBar}>
-          <Pressable
-            accessibilityRole="button"
-            onPress={() => setMode('home')}
-            style={({ pressed }) => [styles.button, styles.stopButton, pressed && styles.buttonPressed]}
-          >
-            <Text style={styles.buttonText}>Stop Camera</Text>
+          {banner && <BannerView banner={banner} onDismiss={() => setBanner(null)} />}
+          {isRecording ? (
+            <Pressable
+              accessibilityRole="button"
+              disabled={phase === 'stopping'}
+              onPress={onStopRecording}
+              style={({ pressed }) => [
+                styles.button,
+                styles.recordButton,
+                (pressed || phase === 'stopping') && styles.buttonPressed,
+              ]}
+            >
+              <Text style={styles.buttonText}>{phase === 'stopping' ? 'Saving…' : 'Stop Recording'}</Text>
+            </Pressable>
+          ) : (
+            <Pressable
+              accessibilityRole="button"
+              disabled={!cameraReady || phase !== 'idle'}
+              onPress={onStartRecording}
+              style={({ pressed }) => [
+                styles.button,
+                styles.recordButton,
+                (pressed || !cameraReady || phase !== 'idle') && styles.buttonDisabled,
+              ]}
+            >
+              <Text style={styles.buttonText}>{phase === 'starting' ? 'Starting…' : 'Start Recording'}</Text>
+            </Pressable>
+          )}
+          <Pressable accessibilityRole="button" onPress={onStopCamera} style={styles.closeCameraButton}>
+            <Text style={styles.closeCameraText}>Stop Camera</Text>
           </Pressable>
         </View>
         <StatusBar style="light" />
@@ -105,9 +216,42 @@ export default function App() {
       >
         <Text style={styles.buttonText}>Start Camera</Text>
       </Pressable>
+      {/* A recording finished by Stop Camera reports here. */}
+      {banner && (
+        <View style={styles.homeBanner}>
+          <BannerView banner={banner} onDismiss={() => setBanner(null)} />
+        </View>
+      )}
       <StatusBar style="auto" />
     </View>
   );
+}
+
+function BannerView({ banner, onDismiss }: { banner: Banner; onDismiss: () => void }) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityHint="Dismisses the message"
+      onPress={onDismiss}
+      style={[styles.banner, banner.kind === 'error' ? styles.bannerError : styles.bannerSuccess]}
+    >
+      <Text style={styles.bannerText}>{banner.text}</Text>
+    </Pressable>
+  );
+}
+
+function describeRecordingFinished(event: RecordingFinishedEvent): Banner {
+  if (!event.ok) {
+    return { kind: 'error', text: `Recording failed: ${event.message}` };
+  }
+  const details = [
+    formatDuration(event.durationSeconds),
+    `${event.width}×${event.height}`,
+    `${(event.sizeBytes / 1_048_576).toFixed(1)} MB`,
+  ].join(' · ');
+  const reason =
+    event.endedBy === 'system' ? `\nStopped by iOS: ${event.note ?? 'the camera was interrupted'}` : '';
+  return { kind: 'success', text: `Saved ${event.fileName}\n${details}${reason}` };
 }
 
 function describeCameraStatus({ state, message }: CameraStateChangeEvent): string {
@@ -118,11 +262,24 @@ function describeCameraStatus({ state, message }: CameraStateChangeEvent): strin
       return 'LIVE';
     case 'interrupted':
       return message ?? 'Camera paused';
-    case 'stopped':
-      return 'Camera stopped';
     case 'error':
       return `Camera error: ${message ?? 'unknown'}`;
   }
+}
+
+function formatElapsed(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatDuration(seconds: number): string {
+  return seconds < 60 ? `${seconds.toFixed(1)} s` : formatElapsed(seconds * 1000);
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 const styles = StyleSheet.create({
@@ -153,6 +310,9 @@ const styles = StyleSheet.create({
   buttonPressed: {
     opacity: 0.8,
   },
+  buttonDisabled: {
+    opacity: 0.5,
+  },
   buttonText: {
     color: '#fff',
     fontSize: 18,
@@ -178,6 +338,12 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#1f7a4d',
   },
+  homeBanner: {
+    position: 'absolute',
+    bottom: 48,
+    left: 16,
+    right: 16,
+  },
   cameraContainer: {
     flex: 1,
     backgroundColor: '#000',
@@ -188,6 +354,9 @@ const styles = StyleSheet.create({
     left: 16,
     right: 16,
     alignItems: 'center',
+  },
+  topBarSpacing: {
+    marginTop: 8,
   },
   cameraStatusText: {
     color: '#fff',
@@ -200,14 +369,64 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     textAlign: 'center',
   },
+  recIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+  },
+  recDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#ff3b30',
+    marginRight: 8,
+  },
+  recText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    fontVariant: ['tabular-nums'],
+  },
   cameraBottomBar: {
     position: 'absolute',
-    bottom: 48,
-    left: 0,
-    right: 0,
+    bottom: 40,
+    left: 16,
+    right: 16,
     alignItems: 'center',
   },
-  stopButton: {
-    backgroundColor: '#b3261e',
+  recordButton: {
+    backgroundColor: '#d70015',
+    minWidth: 220,
+    alignItems: 'center',
+  },
+  closeCameraButton: {
+    marginTop: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 24,
+  },
+  closeCameraText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  banner: {
+    alignSelf: 'stretch',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 12,
+  },
+  bannerSuccess: {
+    backgroundColor: 'rgba(31,122,77,0.92)',
+  },
+  bannerError: {
+    backgroundColor: 'rgba(179,38,30,0.92)',
+  },
+  bannerText: {
+    color: '#fff',
+    fontSize: 14,
   },
 });

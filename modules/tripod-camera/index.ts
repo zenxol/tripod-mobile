@@ -1,10 +1,10 @@
 import type { ComponentType } from 'react';
 import type { ViewProps } from 'react-native';
-import { requireNativeView, requireOptionalNativeModule } from 'expo';
+import { type EventSubscription, NativeModule, requireNativeView, requireOptionalNativeModule } from 'expo';
 
 export type CameraPermissionStatus = 'granted' | 'denied' | 'undetermined';
 
-export type CameraState = 'starting' | 'running' | 'interrupted' | 'stopped' | 'error';
+export type CameraState = 'starting' | 'running' | 'interrupted' | 'error';
 
 export type CameraStateChangeEvent = {
   state: CameraState;
@@ -18,28 +18,88 @@ export type TripodCameraViewProps = ViewProps & {
   onCameraStateChange?: (event: { nativeEvent: CameraStateChangeEvent }) => void;
 };
 
-type TripodCameraNativeModule = {
+/** Why a recording ended: Stop Recording, the camera screen closed, or iOS ended it (interruption, low storage). */
+export type RecordingEndedBy = 'user' | 'cameraClosed' | 'system';
+
+export type RecordingStarted = {
+  fileName: string;
+  /** ISO 8601, when the file actually started being written. */
+  startedAt: string;
+};
+
+export type RecordingInfo = {
+  /** file:// URI in the app's Documents/Recordings folder. */
+  uri: string;
+  fileName: string;
+  durationSeconds: number;
+  width: number;
+  height: number;
+  frameRate: number;
+  sizeBytes: number;
+  startedAt: string;
+  endedBy: RecordingEndedBy;
+  /** Set when iOS ended the recording but the file is still complete (e.g. interruption). */
+  note?: string;
+};
+
+export type RecordingFinishedEvent =
+  | ({ ok: true } & RecordingInfo)
+  | { ok: false; code: string; message: string; endedBy: RecordingEndedBy };
+
+type TripodCameraEvents = {
+  onRecordingFinished: (event: RecordingFinishedEvent) => void;
+};
+
+declare class TripodCameraNativeModule extends NativeModule<TripodCameraEvents> {
   getPermissionStatusAsync(): Promise<CameraPermissionStatus>;
   requestPermissionAsync(): Promise<CameraPermissionStatus>;
-};
+  startRecording(): Promise<RecordingStarted>;
+  stopRecording(): Promise<RecordingInfo>;
+}
 
 // Optional: the module is absent in Expo Go, on web and on Android, where the app
 // should show a message instead of crashing at import time.
-const NativeModule = requireOptionalNativeModule<TripodCameraNativeModule>('TripodCamera');
+const CameraModule = requireOptionalNativeModule<TripodCameraNativeModule>('TripodCamera');
 
 /** False when running without the custom native build (e.g. Expo Go). */
-export const isCameraModuleAvailable = NativeModule != null;
+export const isCameraModuleAvailable = CameraModule != null;
 
-export const TripodCameraView: ComponentType<TripodCameraViewProps> | null = NativeModule
+export const TripodCameraView: ComponentType<TripodCameraViewProps> | null = CameraModule
   ? requireNativeView<TripodCameraViewProps>('TripodCamera')
   : null;
 
+function unavailable(): Error {
+  return new Error('The Tripod camera module is not available in this build.');
+}
+
 export async function getCameraPermissionStatusAsync(): Promise<CameraPermissionStatus> {
-  if (!NativeModule) return 'denied';
-  return NativeModule.getPermissionStatusAsync();
+  if (!CameraModule) return 'denied';
+  return CameraModule.getPermissionStatusAsync();
 }
 
 export async function requestCameraPermissionAsync(): Promise<CameraPermissionStatus> {
-  if (!NativeModule) return 'denied';
-  return NativeModule.requestPermissionAsync();
+  if (!CameraModule) return 'denied';
+  return CameraModule.requestPermissionAsync();
+}
+
+/** Resolves once the native recorder is actually writing. Rejects (e.g. ERR_ALREADY_RECORDING, ERR_CAMERA_NOT_RUNNING). */
+export async function startRecording(): Promise<RecordingStarted> {
+  if (!CameraModule) throw unavailable();
+  return CameraModule.startRecording();
+}
+
+/** Resolves with the saved, verified recording. Rejects with ERR_NOT_RECORDING if nothing is recording. */
+export async function stopRecording(): Promise<RecordingInfo> {
+  if (!CameraModule) throw unavailable();
+  return CameraModule.stopRecording();
+}
+
+/**
+ * Fires every time a recording ends, including endings JS did not request
+ * (interruption, low storage, camera closed). Use it as the source of truth for UI state.
+ */
+export function addRecordingFinishedListener(
+  listener: (event: RecordingFinishedEvent) => void,
+): EventSubscription | null {
+  return CameraModule ? CameraModule.addListener('onRecordingFinished', listener) : null;
 }

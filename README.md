@@ -1,6 +1,6 @@
 # Tripod Mobile
 
-iPhone version of Tripod (pickleball instant replay). **Current state: home screen + live rear-camera preview** (native Swift/AVFoundation module in `modules/tripod-camera`). There's no recording or replay yet.
+iPhone version of Tripod (pickleball instant replay). **Current state: home screen, live rear-camera preview, and plain Start/Stop video recording** (native Swift/AVFoundation module in `modules/tripod-camera`). There's no rolling buffer or replay yet.
 
 | | |
 |---|---|
@@ -69,20 +69,26 @@ A local Expo module (Expo Modules API, Swift). Expo autolinking picks up every f
 |---|---|
 | `expo-module.config.json` | Declares the Apple module class `TripodCameraModule` |
 | `ios/TripodCamera.podspec` | CocoaPods spec (depends on `ExpoModulesCore`, links AVFoundation) |
-| `ios/TripodCameraModule.swift` | JS module `TripodCamera`: `getPermissionStatusAsync`, `requestPermissionAsync`, and the native view (prop `active`, event `onCameraStateChange`) |
-| `ios/TripodCameraView.swift` | `ExpoView` hosting an `AVCaptureVideoPreviewLayer`; starts the session when on screen, stops it when removed |
-| `ios/CameraSessionController.swift` | Owns the `AVCaptureSession` (rear wide camera) on a private serial queue; reports starting/running/interrupted/stopped/error |
+| `ios/TripodCameraModule.swift` | JS module `TripodCamera`: permission functions, `startRecording`, `stopRecording`, event `onRecordingFinished`, and the native view (prop `active`, event `onCameraStateChange`) |
+| `ios/TripodCameraView.swift` | `ExpoView` hosting an `AVCaptureVideoPreviewLayer`; attaches to the shared session while on screen and keeps the screen awake |
+| `ios/CameraSessionController.swift` | The app's single camera (`CameraSessionController.shared`): one `AVCaptureSession` (rear wide camera) plus an `AVCaptureMovieFileOutput`, all on a private serial queue |
 | `index.ts` | TypeScript wrapper. Uses `requireOptionalNativeModule`, so Expo Go and web show a message instead of crashing |
 
-Camera frames go directly from the session to the preview layer; nothing crosses the JavaScript bridge. The camera permission text is `ios.infoPlist.NSCameraUsageDescription` in `app.json`.
+Camera frames go directly from the session to the preview layer and the movie file; nothing crosses the JavaScript bridge. The camera permission text is `ios.infoPlist.NSCameraUsageDescription` in `app.json`.
+
+**Recording (Task 3B milestone; Task 4 replaces it with `AVCaptureVideoDataOutput` + `AVAssetWriter` segments):**
+- H.264, portrait, video only (no audio, so no microphone permission). Resolution comes from the `.high` session preset.
+- Written to `tmp/recording-in-progress/`, checked (readable, has video, duration > 0), then moved to `Documents/Recordings/recording_YYYYMMDD_HHMMSS_<6 hex>.mov`. Leftovers in the in-progress folder are deleted on launch.
+- `stopRecording()` resolves with `{ uri, fileName, durationSeconds, width, height, frameRate, sizeBytes, startedAt, endedBy, note? }`. `onRecordingFinished` fires for every ending, including interruptions, low storage (< 200 MB while recording) and Stop Camera.
+- Recording refuses to start below 500 MB free. `Documents` is visible in the Files app under **On My iPhone → Tripod** (`UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace`).
 
 Because of this module, **Expo Go can no longer show the camera**. The home screen still loads there, but Start Camera explains that the iOS build is required.
 
 ## Project layout
 
 ```
-App.tsx                         home screen + camera preview + permission-denied state
-app.json                        app config (name, bundle ID, iOS settings, camera permission text)
+App.tsx                         home screen, camera + recording controls, permission-denied state
+app.json                        app config (name, bundle ID, iOS settings, camera permission text, Files app access)
 index.ts                        entry point
 modules/tripod-camera/          native Swift camera module (see above)
 .github/workflows/ios-build.yml unsigned iOS CI build

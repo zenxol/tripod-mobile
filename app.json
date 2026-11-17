@@ -11,7 +11,9 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.zenxol.tripod",
       "infoPlist": {
-        "NSCameraUsageDescription": "Tripod uses the camera to show and record the court for instant replays."
+        "NSCameraUsageDescription": "Tripod uses the camera to show and record the court for instant replays.",
+        "UIFileSharingEnabled": true,
+        "LSSupportsOpeningDocumentsInPlace": true
       }
     },
     "android": {
