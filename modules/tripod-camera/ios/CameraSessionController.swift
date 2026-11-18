@@ -55,8 +55,11 @@ private enum CameraSetupError: LocalizedError {
  (readable, has video, duration > 0), then moved to `Documents/Recordings/`. Leftovers in
  the in-progress folder (for example after a crash) are deleted on launch.
 
- NOTE: AVCaptureMovieFileOutput is a milestone only. The rolling buffer (Task 4) needs
- AVCaptureVideoDataOutput + AVAssetWriter segments and will replace it.
+ Rolling buffer: while it runs, the movie file output is swapped out of the session for an
+ AVCaptureVideoDataOutput feeding `RollingBufferRecorder` (AVAssetWriter segments). Only one
+ encoder runs at a time, the camera device and its format stay the same, and recording and
+ buffering refuse to start while the other is active. Stopping the buffer swaps the movie
+ output back in.
  */
 final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDelegate, @unchecked Sendable {
   static let shared = CameraSessionController()
@@ -80,6 +83,19 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
   private var observers: [NSObjectProtocol] = []
   private var active: ActiveRecording?
   private var recordingFinishedHandler: (([String: Any]) -> Void)?
+
+  // Rolling buffer (session queue only, except `buffer`, which is thread-safe).
+  let buffer = RollingBufferRecorder()
+  private let bufferOutput = AVCaptureVideoDataOutput()
+  private var isBufferOutputConfigured = false
+  private var bufferMode = BufferMode.off
+  private var bufferStopCompletions: [([String: Any]) -> Void] = []
+
+  private enum BufferMode {
+    case off
+    case on
+    case stopping
+  }
 
   // Capture settings (session queue only).
   private var videoDevice: AVCaptureDevice?
@@ -121,6 +137,8 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       let rawReason = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
       let reason = rawReason.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
       let message = CameraSessionController.describe(reason)
+      // Finish the buffer's open segment right away (the app may be about to be suspended).
+      self.buffer.pause(message)
       self.queue.async {
         Self.log.notice("Camera interrupted: \(message, privacy: .public)")
         self.emit(.interrupted, message)
@@ -139,8 +157,16 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       }
     })
 
+    buffer.setFailureHandler { [weak self] _ in
+      guard let self else { return }
+      // The recorder already stopped itself; put the movie output back.
+      self.queue.async { self.stopBufferInternal(nil) }
+    }
+
     queue.async {
       try? FileManager.default.removeItem(at: Self.inProgressDirectory)
+      // Buffer footage from a previous launch is stale (or a crash leftover).
+      try? FileManager.default.removeItem(at: RollingBufferRecorder.directory)
     }
   }
 
@@ -196,7 +222,11 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
         return completion(.failure(RecordingError(
           code: "ERR_PERMISSION_DENIED", message: CameraSetupError.notAuthorized.localizedDescription)))
       }
-      guard isMovieOutputReady else {
+      guard bufferMode == .off else {
+        return completion(.failure(RecordingError(
+          code: "ERR_BUFFER_ACTIVE", message: "Stop the replay buffer before starting a recording.")))
+      }
+      guard isMovieOutputReady, session.outputs.contains(movieOutput) else {
         return completion(.failure(RecordingError(
           code: "ERR_RECORDING_UNAVAILABLE", message: "Recording is not available on this camera.")))
       }
@@ -244,6 +274,57 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
         movieOutput.stopRecording()
       }
       active = recording
+    }
+  }
+
+  // MARK: - Rolling buffer API
+
+  /// Swaps in the video data output and starts writing segments. Completes with the buffer status.
+  func startBuffer(_ completion: @escaping RecordingCompletion) {
+    queue.async { [self] in
+      guard bufferMode == .off else {
+        return completion(.failure(RecordingError(
+          code: "ERR_BUFFER_ACTIVE", message: "The replay buffer is already running.")))
+      }
+      guard active == nil else {
+        return completion(.failure(RecordingError(
+          code: "ERR_RECORDING_ACTIVE", message: "Stop the recording before starting the replay buffer.")))
+      }
+      guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
+        return completion(.failure(RecordingError(
+          code: "ERR_PERMISSION_DENIED", message: CameraSetupError.notAuthorized.localizedDescription)))
+      }
+      guard session.isRunning, !session.isInterrupted else {
+        return completion(.failure(RecordingError(
+          code: "ERR_CAMERA_NOT_RUNNING", message: "The camera is not running.")))
+      }
+
+      let config: BufferConfiguration
+      do {
+        config = try attachBufferOutput()
+      } catch {
+        let failure = (error as? RecordingError)
+          ?? RecordingError(code: "ERR_BUFFER_UNAVAILABLE", message: error.localizedDescription)
+        return completion(.failure(failure))
+      }
+      bufferMode = .on
+      buffer.start(config) { [self] result in
+        queue.async { [self] in
+          if case .failure = result, bufferMode == .on {
+            detachBufferOutput()
+            bufferMode = .off
+          }
+          completion(result)
+        }
+      }
+    }
+  }
+
+  /// Finishes the open segment, swaps the movie output back in, and completes with the final
+  /// status. Calling it while the buffer is off just returns the status.
+  func stopBuffer(_ completion: @escaping RecordingCompletion) {
+    queue.async { [self] in
+      stopBufferInternal { status in completion(.success(status)) }
     }
   }
 
@@ -321,6 +402,11 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
 
   private func stopIfUnused() {
     guard clients.isEmpty else { return }
+    if bufferMode != .off {
+      // Finish the buffer first; stopBufferInternal() calls back here to stop the session.
+      stopBufferInternal(nil)
+      return
+    }
     if var recording = active {
       // Finish and save the file first; finishRecording() calls back here to stop the session.
       if !recording.stopRequested {
@@ -384,18 +470,8 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
     }
 
     // Codec and connection settings depend on the active format, so they come last.
-    if isMovieOutputReady, let connection = movieOutput.connection(with: .video) {
-      let codec = CaptureConfiguration.preferredCodec(from: movieOutput.availableVideoCodecTypes)
-      if let codec {
-        movieOutput.setOutputSettings([AVVideoCodecKey: codec], for: connection)
-      }
-      codecName = CaptureConfiguration.codecName(codec)
-      // Stabilization crops and delays the recording relative to the preview; on a tripod it
-      // adds nothing, and turning it off keeps the recorded framing identical to the preview.
-      if connection.isVideoStabilizationSupported {
-        connection.preferredVideoStabilizationMode = .off
-      }
-      CaptureConfiguration.applyRotation(to: connection)
+    if isMovieOutputReady {
+      configureMovieConnection()
     }
 
     pressureObservation = device.observe(\.systemPressureState, options: [.new]) { [weak self] device, _ in
@@ -405,6 +481,170 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
 
     if let note = setupNote {
       Self.log.notice("Capture fallback: \(note, privacy: .public)")
+    }
+  }
+
+  /// Codec, stabilization and rotation for the movie output's connection. Runs at setup and
+  /// again whenever the output is put back after the replay buffer (a new connection).
+  private func configureMovieConnection() {
+    guard let connection = movieOutput.connection(with: .video) else { return }
+    let codec = CaptureConfiguration.preferredCodec(from: movieOutput.availableVideoCodecTypes)
+    if let codec {
+      movieOutput.setOutputSettings([AVVideoCodecKey: codec], for: connection)
+    }
+    codecName = CaptureConfiguration.codecName(codec)
+    // Stabilization crops and delays the recording relative to the preview; on a tripod it
+    // adds nothing, and turning it off keeps the recorded framing identical to the preview.
+    if connection.isVideoStabilizationSupported {
+      connection.preferredVideoStabilizationMode = .off
+    }
+    CaptureConfiguration.applyRotation(to: connection)
+  }
+
+  // MARK: - Rolling buffer (session queue only)
+
+  /// Replaces the movie output with the video data output and returns the writer configuration.
+  private func attachBufferOutput() throws -> BufferConfiguration {
+    if !isBufferOutputConfigured {
+      // Late frames are dropped (and counted) rather than queued: capture never waits for encoding.
+      bufferOutput.alwaysDiscardsLateVideoFrames = true
+      bufferOutput.setSampleBufferDelegate(buffer, queue: buffer.videoQueue)
+      isBufferOutputConfigured = true
+    }
+    // Deliver the camera's own pixel format so no conversion happens before encoding.
+    if let device = videoDevice {
+      let native = CMFormatDescriptionGetMediaSubType(device.activeFormat.formatDescription)
+      if bufferOutput.availableVideoPixelFormatTypes.contains(native) {
+        bufferOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: native]
+      }
+    }
+
+    session.beginConfiguration()
+    if session.outputs.contains(movieOutput) {
+      session.removeOutput(movieOutput)
+    }
+    guard session.canAddOutput(bufferOutput) else {
+      restoreMovieOutput()
+      session.commitConfiguration()
+      throw RecordingError(code: "ERR_BUFFER_UNAVAILABLE", message: "The replay buffer is not available on this camera.")
+    }
+    session.addOutput(bufferOutput)
+    if let connection = bufferOutput.connection(with: .video) {
+      if connection.isVideoStabilizationSupported {
+        connection.preferredVideoStabilizationMode = .off
+      }
+      CaptureConfiguration.applySensorOrientation(to: connection)
+    }
+    session.commitConfiguration()
+    enforceCaptureSettings()
+    return makeBufferConfiguration()
+  }
+
+  /// Removes the video data output and puts the movie output back.
+  private func detachBufferOutput() {
+    session.beginConfiguration()
+    if session.outputs.contains(bufferOutput) {
+      session.removeOutput(bufferOutput)
+    }
+    restoreMovieOutput()
+    session.commitConfiguration()
+    enforceCaptureSettings()
+  }
+
+  /// Call between beginConfiguration and commitConfiguration.
+  private func restoreMovieOutput() {
+    guard isMovieOutputReady, !session.outputs.contains(movieOutput) else { return }
+    guard session.canAddOutput(movieOutput) else {
+      Self.log.error("Movie file output could not be restored; recording unavailable")
+      return
+    }
+    session.addOutput(movieOutput)
+    configureMovieConnection()
+  }
+
+  private func makeBufferConfiguration() -> BufferConfiguration {
+    let codec = CaptureConfiguration.preferredCodec(
+      from: bufferOutput.availableVideoCodecTypesForAssetWriter(writingTo: .mov)) ?? .h264
+    let dimensions = videoDevice.map {
+      CMVideoFormatDescriptionGetDimensions($0.activeFormat.formatDescription)
+    } ?? CMVideoDimensions(width: 1920, height: 1080)
+    let fps = videoDevice.map(Self.currentFps) ?? 30
+
+    // AVFoundation's recommendation for this output (the same quality and bitrate the movie
+    // output uses), then that plus 1 s keyframes, then a minimal fallback.
+    let minimal: [String: Any] = [
+      AVVideoCodecKey: codec,
+      AVVideoWidthKey: Int(dimensions.width),
+      AVVideoHeightKey: Int(dimensions.height),
+    ]
+    var recommended: [String: Any]?
+    if let raw = bufferOutput.recommendedVideoSettings(forVideoCodecType: codec, assetWriterOutputFileType: .mov) {
+      var converted: [String: Any] = [:]
+      for (key, value) in raw {
+        if let key = key as? String {
+          converted[key] = value
+        }
+      }
+      recommended = converted.isEmpty ? nil : converted
+    }
+    var candidates: [[String: Any]] = []
+    if var tuned = recommended {
+      var compression = tuned[AVVideoCompressionPropertiesKey] as? [String: Any] ?? [:]
+      compression[AVVideoMaxKeyFrameIntervalDurationKey] = CaptureConfiguration.bufferKeyFrameIntervalSeconds
+      tuned[AVVideoCompressionPropertiesKey] = compression
+      candidates.append(tuned)
+    }
+    if let recommended {
+      candidates.append(recommended)
+    }
+    candidates.append(minimal)
+
+    let base = recommended ?? minimal
+    let bitRate = (base[AVVideoCompressionPropertiesKey] as? [String: Any])?[AVVideoAverageBitRateKey] as? NSNumber
+    // Unknown bitrate: assume a generous 30 Mbit/s for the free-space check.
+    let bytesPerSecond = (bitRate?.doubleValue ?? 30_000_000) / 8
+
+    // Frames arrive in sensor orientation; the display size is rotated like the recordings.
+    let rotated = Int(CaptureConfiguration.rotationAngle) % 180 != 0
+    let config = BufferConfiguration(
+      videoSettingsCandidates: candidates,
+      transform: CaptureConfiguration.displayTransform,
+      codec: CaptureConfiguration.codecName(codec),
+      displayWidth: Int(rotated ? dimensions.height : dimensions.width),
+      displayHeight: Int(rotated ? dimensions.width : dimensions.height),
+      fps: fps,
+      clock: session.synchronizationClock ?? CMClockGetHostTimeClock(),
+      estimatedBytesPerSecond: bytesPerSecond)
+    Self.log.info("Buffer config: \(config.codec, privacy: .public) \(Int(dimensions.width))x\(Int(dimensions.height)) @ \(fps) fps, ~\(Int(bytesPerSecond * 8 / 1_000_000)) Mbit/s, recommended settings: \(recommended != nil)")
+    return config
+  }
+
+  /// Stops the recorder (if running), restores the movie output, then completes. Repeated calls
+  /// while stopping join the same stop.
+  private func stopBufferInternal(_ completion: (([String: Any]) -> Void)?) {
+    switch bufferMode {
+    case .off:
+      completion?(buffer.currentStatus())
+    case .stopping:
+      if let completion {
+        bufferStopCompletions.append(completion)
+      }
+    case .on:
+      if let completion {
+        bufferStopCompletions.append(completion)
+      }
+      bufferMode = .stopping
+      buffer.stop { [self] status in
+        queue.async { [self] in
+          detachBufferOutput()
+          bufferMode = .off
+          let completions = bufferStopCompletions
+          bufferStopCompletions = []
+          completions.forEach { $0(status) }
+          // The camera may have been closed while the buffer was finishing.
+          stopIfUnused()
+        }
+      }
     }
   }
 
@@ -449,6 +689,7 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       return
     }
     isThermallyThrottled = shouldThrottle
+    buffer.setNominalFps(fps)
     Self.log.notice("System pressure \(level.rawValue, privacy: .public): frame rate now \(fps) fps")
     if session.isRunning && !session.isInterrupted {
       emit(.running, nil)
@@ -530,6 +771,7 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
   private func handleRuntimeError(_ error: AVError?) {
     let message = error?.localizedDescription ?? "The camera stopped because of an unknown error."
     Self.log.error("Camera runtime error: \(message, privacy: .public)")
+    buffer.pause(message)
     emit(.error, message)
     // After a media services reset the session must be restarted (startIfNeeded re-applies
     // the capture settings); other errors are left to the user (leave and reopen the camera)

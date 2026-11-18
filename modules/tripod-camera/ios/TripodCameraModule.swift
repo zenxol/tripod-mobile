@@ -7,11 +7,15 @@ public final class TripodCameraModule: Module {
 
     /// Sent every time a recording ends: Stop Recording, camera closed, interruption,
     /// low storage or failure. Payload has `ok: true` + metadata, or `ok: false` + code/message.
-    Events("onRecordingFinished")
+    /// `onBufferStatus`: replay buffer diagnostics, sent on every state change and finished segment.
+    Events("onRecordingFinished", "onBufferStatus")
 
     OnCreate {
       CameraSessionController.shared.setRecordingFinishedHandler { [weak self] event in
         self?.sendEvent("onRecordingFinished", event.mapValues { $0 as Any? })
+      }
+      CameraSessionController.shared.buffer.setStatusHandler { [weak self] status in
+        self?.sendEvent("onBufferStatus", status.mapValues { $0 as Any? })
       }
     }
 
@@ -40,6 +44,29 @@ public final class TripodCameraModule: Module {
       CameraSessionController.shared.stopRecording { result in
         Self.settle(promise, result)
       }
+    }
+
+    /// Starts the rolling replay buffer; resolves with its status. Rejects while recording.
+    AsyncFunction("startBuffer") { (promise: Promise) in
+      CameraSessionController.shared.startBuffer { result in
+        Self.settle(promise, result)
+      }
+    }
+
+    /// Stops the buffer after its last segment is written; resolves with the final status.
+    AsyncFunction("stopBuffer") { (promise: Promise) in
+      CameraSessionController.shared.stopBuffer { result in
+        Self.settle(promise, result)
+      }
+    }
+
+    AsyncFunction("getBufferStatus") { (promise: Promise) in
+      promise.resolve(CameraSessionController.shared.buffer.currentStatus())
+    }
+
+    /// Finished segments currently kept, oldest first.
+    AsyncFunction("getBufferSegments") { (promise: Promise) in
+      promise.resolve(CameraSessionController.shared.buffer.currentSegments())
     }
 
     View(TripodCameraView.self) {

@@ -38,6 +38,29 @@ enum CaptureConfiguration {
     }
   }
 
+  /// Keeps a frame-delivering connection (the replay buffer's video data output) in the sensor's
+  /// native landscape orientation, so the camera never rotates pixels. The display rotation is
+  /// stored in each file instead (`displayTransform`).
+  static func applySensorOrientation(to connection: AVCaptureConnection) {
+    if #available(iOS 17.0, *) {
+      if connection.isVideoRotationAngleSupported(0) {
+        connection.videoRotationAngle = 0
+      }
+    } else if connection.isVideoOrientationSupported {
+      connection.videoOrientation = .landscapeRight // the back camera's native orientation
+    }
+  }
+
+  /// `rotationAngle` as a track transform: players show sensor-oriented frames upright, exactly
+  /// like the preview and the movie-file recordings.
+  static var displayTransform: CGAffineTransform {
+    CGAffineTransform(rotationAngle: rotationAngle * .pi / 180)
+  }
+
+  /// Keyframe spacing for replay-buffer segments: short enough for precise seeking and trimming
+  /// in the later replay and save features.
+  static let bufferKeyFrameIntervalSeconds: Double = 1
+
   /// Picks the best supported format for the first target the device supports.
   static func selectFormat(for device: AVCaptureDevice) -> FormatSelection? {
     for (index, target) in targets.enumerated() {

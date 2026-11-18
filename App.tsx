@@ -3,21 +3,34 @@ import { useEffect, useRef, useState } from 'react';
 import { Alert, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import {
+  type BufferStatus,
   type CameraStateChangeEvent,
   type CaptureSettings,
   type RecordingFinishedEvent,
   TripodCameraView,
+  addBufferStatusListener,
   addRecordingFinishedListener,
   getCameraPermissionStatusAsync,
   isCameraModuleAvailable,
   requestCameraPermissionAsync,
+  startBuffer,
   startRecording,
+  stopBuffer,
   stopRecording,
 } from './modules/tripod-camera';
 
 type Mode = 'home' | 'denied' | 'camera';
 type RecordingPhase = 'idle' | 'starting' | 'recording' | 'stopping';
+type BufferRequest = 'none' | 'starting' | 'stopping';
 type Banner = { kind: 'success' | 'error'; text: string };
+
+/** Buffer states during which recording is blocked and the button shows Stop Buffer. */
+const BUFFER_ACTIVE_STATES: ReadonlySet<BufferStatus['state']> = new Set([
+  'starting',
+  'buffering',
+  'paused',
+  'stopping',
+]);
 
 export default function App() {
   const [mode, setMode] = useState<Mode>('home');
@@ -28,8 +41,11 @@ export default function App() {
   const [recordingStartedAt, setRecordingStartedAt] = useState<number | null>(null);
   const [elapsedMs, setElapsedMs] = useState(0);
   const [banner, setBanner] = useState<Banner | null>(null);
+  const [bufferStatus, setBufferStatus] = useState<BufferStatus | null>(null);
+  const [bufferRequest, setBufferRequest] = useState<BufferRequest>('none');
   // Guards against double taps before React re-renders the disabled button.
   const recordingRequest = useRef(false);
+  const bufferRequestRef = useRef(false);
 
   // Every recording ending (requested or not) arrives here: the single source of truth for UI state.
   useEffect(() => {
@@ -38,6 +54,20 @@ export default function App() {
       setPhase('idle');
       setRecordingStartedAt(null);
       setBanner(describeRecordingFinished(event));
+    });
+    return () => subscription?.remove();
+  }, []);
+
+  // Buffer diagnostics: every state change and every finished segment.
+  useEffect(() => {
+    let lastLogged = '';
+    const subscription = addBufferStatusListener((status) => {
+      setBufferStatus(status);
+      const line = `${status.state} ${status.segmentCount} segs ${status.bufferedSeconds.toFixed(1)} s`;
+      if (line !== lastLogged) {
+        lastLogged = line;
+        console.log(`[buffer] ${formatBufferSummary(status)}${status.message ? ` (${status.message})` : ''}`);
+      }
     });
     return () => subscription?.remove();
   }, []);
@@ -115,6 +145,35 @@ export default function App() {
     }
   };
 
+  const onStartBuffer = async () => {
+    if (bufferRequestRef.current || phase !== 'idle') return;
+    bufferRequestRef.current = true;
+    setBanner(null);
+    setBufferRequest('starting');
+    try {
+      setBufferStatus(await startBuffer());
+    } catch (e) {
+      setBanner({ kind: 'error', text: `Could not start the buffer: ${errorMessage(e)}` });
+    } finally {
+      bufferRequestRef.current = false;
+      setBufferRequest('none');
+    }
+  };
+
+  const onStopBuffer = async () => {
+    if (bufferRequestRef.current) return;
+    bufferRequestRef.current = true;
+    setBufferRequest('stopping');
+    try {
+      setBufferStatus(await stopBuffer());
+    } catch (e) {
+      setBanner({ kind: 'error', text: `Could not stop the buffer: ${errorMessage(e)}` });
+    } finally {
+      bufferRequestRef.current = false;
+      setBufferRequest('none');
+    }
+  };
+
   const onCameraEvent = (event: CameraStateChangeEvent) => {
     setCameraStatus(event);
     const next = event.settings;
@@ -138,6 +197,11 @@ export default function App() {
   if (mode === 'camera' && TripodCameraView) {
     const cameraReady = cameraStatus.state === 'running';
     const isRecording = phase === 'recording' || phase === 'stopping';
+    const bufferActive =
+      bufferRequest !== 'none' || (bufferStatus != null && BUFFER_ACTIVE_STATES.has(bufferStatus.state));
+    const showBufferPanel =
+      bufferStatus != null && (bufferActive || bufferStatus.segmentCount > 0 || bufferStatus.state === 'error');
+    const canStartRecording = cameraReady && phase === 'idle' && !bufferActive;
     return (
       <View style={styles.cameraContainer}>
         <TripodCameraView
@@ -164,9 +228,43 @@ export default function App() {
               {captureSettings.note ? `\n${captureSettings.note}` : ''}
             </Text>
           )}
+          {showBufferPanel && bufferStatus && <BufferPanel status={bufferStatus} />}
         </View>
         <View style={styles.cameraBottomBar}>
           {banner && <BannerView banner={banner} onDismiss={() => setBanner(null)} />}
+          {bufferActive ? (
+            <Pressable
+              accessibilityRole="button"
+              disabled={bufferRequest !== 'none' || bufferStatus?.state === 'stopping'}
+              onPress={onStopBuffer}
+              style={({ pressed }) => [
+                styles.button,
+                styles.bufferButton,
+                (pressed || bufferRequest !== 'none') && styles.buttonPressed,
+              ]}
+            >
+              <Text style={styles.buttonText}>
+                {bufferRequest === 'starting'
+                  ? 'Starting…'
+                  : bufferRequest === 'stopping' || bufferStatus?.state === 'stopping'
+                    ? 'Stopping…'
+                    : 'Stop Buffer'}
+              </Text>
+            </Pressable>
+          ) : (
+            <Pressable
+              accessibilityRole="button"
+              disabled={!cameraReady || phase !== 'idle'}
+              onPress={onStartBuffer}
+              style={({ pressed }) => [
+                styles.button,
+                styles.bufferButton,
+                (pressed || !cameraReady || phase !== 'idle') && styles.buttonDisabled,
+              ]}
+            >
+              <Text style={styles.buttonText}>Start Buffer</Text>
+            </Pressable>
+          )}
           {isRecording ? (
             <Pressable
               accessibilityRole="button"
@@ -183,12 +281,12 @@ export default function App() {
           ) : (
             <Pressable
               accessibilityRole="button"
-              disabled={!cameraReady || phase !== 'idle'}
+              disabled={!canStartRecording}
               onPress={onStartRecording}
               style={({ pressed }) => [
                 styles.button,
                 styles.recordButton,
-                (pressed || !cameraReady || phase !== 'idle') && styles.buttonDisabled,
+                (pressed || !canStartRecording) && styles.buttonDisabled,
               ]}
             >
               <Text style={styles.buttonText}>{phase === 'starting' ? 'Starting…' : 'Start Recording'}</Text>
@@ -260,6 +358,39 @@ function BannerView({ banner, onDismiss }: { banner: Banner; onDismiss: () => vo
       <Text style={styles.bannerText}>{banner.text}</Text>
     </Pressable>
   );
+}
+
+/** Minimal replay-buffer diagnostics (Task 4A test UI). */
+function BufferPanel({ status }: { status: BufferStatus }) {
+  const last = status.lastSegment;
+  const lines = [
+    formatBufferSummary(status),
+    `${status.codec.toUpperCase()} ${status.width}×${status.height} · ${Math.round(status.fps)} fps target`,
+    last
+      ? `Last segment: ${last.durationSeconds.toFixed(2)} s · ${last.frameCount} frames · ${last.fps.toFixed(1)} fps`
+      : 'Last segment: none yet',
+    `Dropped ${status.captureDroppedFrames} (camera) + ${status.writerDroppedFrames} (encoder) · missing ${status.missingFrames}`,
+    `Gaps ${status.gaps} · breaks ${status.discontinuities} · failed ${status.failedSegments}`,
+  ];
+  if (status.message) lines.push(status.message);
+  return (
+    <View style={[styles.bufferPanel, status.state === 'error' && styles.bufferPanelError]}>
+      {lines.map((line, i) => (
+        <Text key={i} style={[styles.bufferText, i === 0 && styles.bufferTitle]}>
+          {line}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
+function formatBufferSummary(s: BufferStatus): string {
+  return [
+    `BUFFER ${s.state.toUpperCase()}`,
+    `${s.segmentCount} segments`,
+    `${s.bufferedSeconds.toFixed(1)} s`,
+    `${(s.storageBytes / 1_048_576).toFixed(0)} MB`,
+  ].join(' · ');
 }
 
 function describeRecordingFinished(event: RecordingFinishedEvent): Banner {
@@ -440,6 +571,32 @@ const styles = StyleSheet.create({
     backgroundColor: '#d70015',
     minWidth: 220,
     alignItems: 'center',
+  },
+  bufferButton: {
+    backgroundColor: '#0a5fb4',
+    minWidth: 220,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  bufferPanel: {
+    marginTop: 8,
+    alignSelf: 'stretch',
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  bufferPanelError: {
+    backgroundColor: 'rgba(179,38,30,0.8)',
+  },
+  bufferText: {
+    color: '#fff',
+    fontSize: 12,
+    fontVariant: ['tabular-nums'],
+  },
+  bufferTitle: {
+    fontSize: 13,
+    fontWeight: '700',
   },
   closeCameraButton: {
     marginTop: 12,

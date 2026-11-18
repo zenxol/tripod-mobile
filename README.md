@@ -1,6 +1,6 @@
 # Tripod Mobile
 
-iPhone version of Tripod (pickleball instant replay). **Current state: home screen, live rear-camera preview, and plain Start/Stop video recording** (native Swift/AVFoundation module in `modules/tripod-camera`). There's no rolling buffer or replay yet.
+iPhone version of Tripod (pickleball instant replay). **Current state: home screen, live rear-camera preview, plain Start/Stop video recording, and a test-only Start/Stop Buffer control for the rolling replay buffer** (native Swift/AVFoundation module in `modules/tripod-camera`). There's no replay playback or Save Replay yet.
 
 | | |
 |---|---|
@@ -73,11 +73,22 @@ A local Expo module (Expo Modules API, Swift). Expo autolinking picks up every f
 | `ios/TripodCameraView.swift` | `ExpoView` hosting an `AVCaptureVideoPreviewLayer`; attaches to the shared session while on screen and keeps the screen awake |
 | `ios/CameraSessionController.swift` | The app's single camera (`CameraSessionController.shared`): one `AVCaptureSession` (rear wide camera) plus an `AVCaptureMovieFileOutput`, all on a private serial queue |
 | `ios/CaptureConfiguration.swift` | Capture quality policy: camera, rotation, format/frame-rate targets and fallbacks, codec preference |
+| `ios/RollingBufferRecorder.swift` | Rolling replay buffer: `AVCaptureVideoDataOutput` frames → `AVAssetWriter` 5 s segments, retention, diagnostics |
 | `index.ts` | TypeScript wrapper. Uses `requireOptionalNativeModule`, so Expo Go and web show a message instead of crashing |
 
 Camera frames go directly from the session to the preview layer and the movie file; nothing crosses the JavaScript bridge. The camera permission text is `ios.infoPlist.NSCameraUsageDescription` in `app.json`.
 
-**Recording (Task 3B milestone; Task 4 replaces it with `AVCaptureVideoDataOutput` + `AVAssetWriter` segments):**
+**Rolling replay buffer (Task 4A; `startBuffer()` / `stopBuffer()`, event `onBufferStatus`):**
+- **One session, one encoder:** starting the buffer swaps the movie file output out of the session for an `AVCaptureVideoDataOutput`, and stopping swaps it back. The camera, its format and the preview are unchanged. Recording and buffering refuse to start while the other runs (`ERR_BUFFER_ACTIVE`, `ERR_RECORDING_ACTIVE`).
+- **Pipeline:** camera frames arrive in the camera's native pixel format and orientation on a dedicated queue and are appended straight to an `AVAssetWriter` (HEVC, else H.264; AVFoundation's recommended settings for the output, plus 1 s keyframes). The portrait rotation is stored as a track transform; pixels are never rotated or converted. No frames are held in memory.
+- **Segment rotation:** at the first frame whose timestamp is ≥ 5 s after the segment's first frame. That frame starts the next segment, and the old one ends exactly at its timestamp, so the timeline has no holes. The next writer is created and started in advance on another queue.
+- **Files:** `tmp/rolling-buffer/writing_NNNNNN.mov`, renamed to `segment_NNNNNN.mov` only after `finishWriting` succeeds. Each segment records its file name, capture-clock start/end, wall-clock start/end, duration, frame count and size.
+- **Retention:** after each segment, the oldest segments are deleted while the rest still cover 120 s + 10 s margin, so about 130–135 s is kept (≈ 27 segments). The folder is emptied on every Start Buffer and on launch. Stop Buffer keeps the last buffer's files until then.
+- **Storage guard:** starting needs room for the whole buffer (estimated from the encoder bitrate) plus 300 MB; the buffer stops with `ERR_LOW_STORAGE` if free space falls below 300 MB.
+- **Interruptions:** the open segment is finished and kept (with extra background time requested from iOS), the status becomes `paused`, and buffering resumes with a new segment (`followsGap: true`) when frames return. Closing the camera stops the buffer first, then the session.
+- **Diagnostics (`onBufferStatus`, `getBufferStatus()`, `getBufferSegments()`):** state, segment count, buffered seconds, storage bytes, codec/size/fps, frames written, frames dropped by the camera or the encoder, frames missing according to timestamps, gaps, discontinuities between segments, failed segments, and the newest segment. Native logs: subsystem `com.zenxol.tripod`, category `buffer`.
+
+**Recording (Task 3B milestone, used while the buffer is off):**
 - **Format:** picked from the camera's actual formats. It tries 1080p60, then 1080p30, then 720p60, then 720p30, then the default `.high` preset. Only 8-bit SDR formats are used; it prefers non-binned formats and the widest field of view. The frame rate is locked (min = max), and drops to 30 fps while the phone reports serious thermal pressure.
 - **Same settings everywhere:** the format is set on the device, so the preview and the recording match. Stabilization is off and both use the same rotation, so the recorded framing equals the preview.
 - **Codec:** HEVC when the output supports it, else H.264. Portrait, video only (no audio, so no microphone permission).
@@ -91,7 +102,7 @@ Because of this module, **Expo Go can no longer show the camera**. The home scre
 ## Project layout
 
 ```
-App.tsx                         home screen, camera + recording controls, permission-denied state
+App.tsx                         home screen, camera + recording + buffer controls, buffer diagnostics, permission-denied state
 app.json                        app config (name, bundle ID, iOS settings, camera permission text, Files app access)
 index.ts                        entry point
 modules/tripod-camera/          native Swift camera module (see above)
