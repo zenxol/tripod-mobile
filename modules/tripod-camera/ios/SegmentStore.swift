@@ -196,8 +196,11 @@ struct SegmentStore {
       let remaining = (pinCounts[index] ?? 1) - 1
       pinCounts[index] = remaining > 0 ? remaining : nil
     }
+    // Read-only passes first, then one assignment: mutating `retired` while the closure reads
+    // `self` (isProtected) would be an overlapping access.
     let free = retired.filter { !isProtected($0.index) }
-    retired.removeAll { !isProtected($0.index) }
+    let stillProtected = retired.filter { isProtected($0.index) }
+    retired = stillProtected
     return free.map(\.fileName)
   }
 
