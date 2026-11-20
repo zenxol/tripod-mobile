@@ -6,13 +6,18 @@ import {
   type BufferStatus,
   type CameraStateChangeEvent,
   type CaptureSettings,
+  DEFAULT_REPLAY_DURATION,
+  REPLAY_DURATIONS,
   type RecordingFinishedEvent,
+  type ReplayDuration,
+  type ReplayInfo,
   TripodCameraView,
   addBufferStatusListener,
   addRecordingFinishedListener,
   getCameraPermissionStatusAsync,
   isCameraModuleAvailable,
   requestCameraPermissionAsync,
+  saveReplay,
   startBuffer,
   startRecording,
   stopBuffer,
@@ -22,7 +27,10 @@ import {
 type Mode = 'home' | 'denied' | 'camera';
 type RecordingPhase = 'idle' | 'starting' | 'recording' | 'stopping';
 type BufferRequest = 'none' | 'starting' | 'stopping';
-type Banner = { kind: 'success' | 'error'; text: string };
+type Banner = { kind: 'success' | 'error' | 'info'; text: string };
+
+/** Ignore a second Save Replay tap this soon after the first (accidental double tap). */
+const SAVE_REPLAY_DEBOUNCE_MS = 500;
 
 /** Buffer states during which recording is blocked and the button shows Stop Buffer. */
 const BUFFER_ACTIVE_STATES: ReadonlySet<BufferStatus['state']> = new Set([
@@ -46,6 +54,9 @@ export default function App() {
   // Guards against double taps before React re-renders the disabled button.
   const recordingRequest = useRef(false);
   const bufferRequestRef = useRef(false);
+  const [replayDuration, setReplayDuration] = useState<ReplayDuration>(DEFAULT_REPLAY_DURATION);
+  const [savingCount, setSavingCount] = useState(0);
+  const lastSavePress = useRef(0);
 
   // Every recording ending (requested or not) arrives here: the single source of truth for UI state.
   useEffect(() => {
@@ -174,6 +185,25 @@ export default function App() {
     }
   };
 
+  const onSaveReplay = async () => {
+    const now = Date.now();
+    if (now - lastSavePress.current < SAVE_REPLAY_DEBOUNCE_MS) return;
+    lastSavePress.current = now;
+    const seconds = replayDuration;
+    // Each press is its own save: native code fixes the endpoint immediately and queues the export.
+    setSavingCount((count) => count + 1);
+    setBanner({ kind: 'info', text: `Saving the last ${seconds} s…` });
+    try {
+      const info = await saveReplay(seconds);
+      console.log(`[replay] saved ${info.fileName}: ${info.durationSeconds.toFixed(2)} s in ${info.exportSeconds} s`);
+      setBanner(describeReplaySaved(info));
+    } catch (e) {
+      setBanner({ kind: 'error', text: `Replay not saved: ${errorMessage(e)}` });
+    } finally {
+      setSavingCount((count) => count - 1);
+    }
+  };
+
   const onCameraEvent = (event: CameraStateChangeEvent) => {
     setCameraStatus(event);
     const next = event.settings;
@@ -202,6 +232,10 @@ export default function App() {
     const showBufferPanel =
       bufferStatus != null && (bufferActive || bufferStatus.segmentCount > 0 || bufferStatus.state === 'error');
     const canStartRecording = cameraReady && phase === 'idle' && !bufferActive;
+    const canSaveReplay =
+      bufferRequest === 'none' &&
+      bufferStatus != null &&
+      (bufferStatus.state === 'buffering' || bufferStatus.segmentCount > 0);
     return (
       <View style={styles.cameraContainer}>
         <TripodCameraView
@@ -232,6 +266,35 @@ export default function App() {
         </View>
         <View style={styles.cameraBottomBar}>
           {banner && <BannerView banner={banner} onDismiss={() => setBanner(null)} />}
+          <View style={styles.durationRow} accessibilityRole="radiogroup">
+            {REPLAY_DURATIONS.map((seconds) => (
+              <Pressable
+                key={seconds}
+                accessibilityRole="radio"
+                accessibilityState={{ selected: seconds === replayDuration }}
+                onPress={() => setReplayDuration(seconds)}
+                style={[styles.durationChip, seconds === replayDuration && styles.durationChipSelected]}
+              >
+                <Text style={[styles.durationText, seconds === replayDuration && styles.durationTextSelected]}>
+                  {seconds}s
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            disabled={!canSaveReplay}
+            onPress={onSaveReplay}
+            style={({ pressed }) => [
+              styles.button,
+              styles.replayButton,
+              (pressed || !canSaveReplay) && styles.buttonDisabled,
+            ]}
+          >
+            <Text style={styles.buttonText}>
+              {savingCount > 0 ? `Save Replay (${savingCount} saving…)` : `Save Last ${replayDuration}s`}
+            </Text>
+          </Pressable>
           {bufferActive ? (
             <Pressable
               accessibilityRole="button"
@@ -353,7 +416,10 @@ function BannerView({ banner, onDismiss }: { banner: Banner; onDismiss: () => vo
       accessibilityRole="button"
       accessibilityHint="Dismisses the message"
       onPress={onDismiss}
-      style={[styles.banner, banner.kind === 'error' ? styles.bannerError : styles.bannerSuccess]}
+      style={[
+        styles.banner,
+        banner.kind === 'error' ? styles.bannerError : banner.kind === 'info' ? styles.bannerInfo : styles.bannerSuccess,
+      ]}
     >
       <Text style={styles.bannerText}>{banner.text}</Text>
     </Pressable>
@@ -365,16 +431,26 @@ function BufferPanel({ status }: { status: BufferStatus }) {
   const last = status.lastSegment;
   const lines = [
     formatBufferSummary(status),
-    `${status.codec.toUpperCase()} ${status.width}×${status.height} · ${Math.round(status.fps)} fps target`,
+    `${status.codec.toUpperCase()} ${status.width}×${status.height} · ${Math.round(status.fps)} fps target · ${status.measuredFps.toFixed(1)} fps measured`,
     last
-      ? `Last segment: ${last.durationSeconds.toFixed(2)} s · ${last.frameCount} frames · ${last.fps.toFixed(1)} fps`
+      ? `Last segment: ${last.durationSeconds.toFixed(2)} s · ${last.frameCount} frames · max gap ${last.maxFrameIntervalMs.toFixed(1)} ms`
       : 'Last segment: none yet',
     `Dropped ${status.captureDroppedFrames} (camera) + ${status.writerDroppedFrames} (encoder) · missing ${status.missingFrames}`,
-    `Gaps ${status.gaps} · breaks ${status.discontinuities} · failed ${status.failedSegments}`,
+    `Pauses ${status.gaps} · segment gaps ${status.segmentGaps} · overlaps ${status.segmentOverlaps} · failed ${status.failedSegments}`,
+    `Disk ${formatMB(status.diskBytes)} in ${status.fileCount} files · RAM ${formatMB(status.memoryBytes)} · expired ${status.expiredSegments}`,
   ];
   if (status.message) lines.push(status.message);
+  // Amber when continuity or file problems were detected (camera drops are shown but not flagged).
+  const hasProblems =
+    status.segmentGaps + status.segmentOverlaps + status.orderingErrors + status.failedSegments + status.outOfOrderFrames > 0;
   return (
-    <View style={[styles.bufferPanel, status.state === 'error' && styles.bufferPanelError]}>
+    <View
+      style={[
+        styles.bufferPanel,
+        hasProblems && styles.bufferPanelWarning,
+        status.state === 'error' && styles.bufferPanelError,
+      ]}
+    >
       {lines.map((line, i) => (
         <Text key={i} style={[styles.bufferText, i === 0 && styles.bufferTitle]}>
           {line}
@@ -389,8 +465,26 @@ function formatBufferSummary(s: BufferStatus): string {
     `BUFFER ${s.state.toUpperCase()}`,
     `${s.segmentCount} segments`,
     `${s.bufferedSeconds.toFixed(1)} s`,
-    `${(s.storageBytes / 1_048_576).toFixed(0)} MB`,
+    formatMB(s.storageBytes),
   ].join(' · ');
+}
+
+function formatMB(bytes: number): string {
+  return `${(bytes / 1_048_576).toFixed(0)} MB`;
+}
+
+function describeReplaySaved(info: ReplayInfo): Banner {
+  const details = [
+    `${info.durationSeconds.toFixed(2)} s`,
+    `${info.width}×${info.height}`,
+    info.codec.toUpperCase(),
+    formatMB(info.sizeBytes),
+    `export ${info.exportSeconds.toFixed(1)} s`,
+  ].join(' · ');
+  return {
+    kind: 'success',
+    text: `Saved ${info.fileName}\n${details}${info.note ? `\n${info.note}` : ''}`,
+  };
 }
 
 function describeRecordingFinished(event: RecordingFinishedEvent): Banner {
@@ -585,6 +679,47 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     paddingVertical: 6,
     paddingHorizontal: 10,
+  },
+  replayButton: {
+    backgroundColor: '#e07a00',
+    minWidth: 220,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  durationRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    marginBottom: 10,
+  },
+  durationChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    marginHorizontal: 3,
+    marginVertical: 3,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.6)',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  durationChipSelected: {
+    backgroundColor: '#fff',
+    borderColor: '#fff',
+  },
+  durationText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    fontVariant: ['tabular-nums'],
+  },
+  durationTextSelected: {
+    color: '#111',
+  },
+  bannerInfo: {
+    backgroundColor: 'rgba(40,40,40,0.9)',
+  },
+  bufferPanelWarning: {
+    backgroundColor: 'rgba(160,100,0,0.85)',
   },
   bufferPanelError: {
     backgroundColor: 'rgba(179,38,30,0.8)',

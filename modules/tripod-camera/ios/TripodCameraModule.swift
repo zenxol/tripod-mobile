@@ -69,6 +69,19 @@ public final class TripodCameraModule: Module {
       promise.resolve(CameraSessionController.shared.buffer.currentSegments())
     }
 
+    /// Saves the previous `seconds` (10, 15, 20, 30, 60 or 120) of the replay buffer as an MP4 in
+    /// Documents/Replays, without interrupting capture. Resolves with { uri, durationSeconds, ... }.
+    AsyncFunction("saveReplay") { (seconds: Double, promise: Promise) in
+      ReplaySaver.shared.save(seconds: seconds) { result in
+        switch result {
+        case .success(let info):
+          promise.resolve(info)
+        case .failure(let error):
+          promise.reject(error.code, error.message)
+        }
+      }
+    }
+
     View(TripodCameraView.self) {
       Events("onCameraStateChange")
 

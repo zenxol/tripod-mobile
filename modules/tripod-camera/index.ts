@@ -89,6 +89,10 @@ export type BufferSegment = {
   frameCount: number;
   /** frameCount / durationSeconds, from real timestamps. */
   fps: number;
+  /** Frames missing inside this segment according to the timestamps. */
+  missingFrames: number;
+  /** Longest interval between two consecutive frames in this segment. */
+  maxFrameIntervalMs: number;
   sizeBytes: number;
   /** Capture stopped before this segment (interruption or timestamp gap). */
   followsGap: boolean;
@@ -103,6 +107,11 @@ export type BufferStatus = {
   bufferedSeconds: number;
   /** Disk space used by the kept segments. */
   storageBytes: number;
+  /** Everything in the buffer folder, including files being written and protected expired segments. */
+  diskBytes: number;
+  fileCount: number;
+  /** The app's physical memory footprint, sampled with each segment. */
+  memoryBytes: number;
   segmentSeconds: number;
   retentionSeconds: number;
   safetyMarginSeconds: number;
@@ -110,21 +119,72 @@ export type BufferStatus = {
   /** As displayed (portrait). */
   width: number;
   height: number;
+  /** Frame rate the camera is locked to. */
   fps: number;
+  /** Frame rate measured from the newest segment's timestamps. */
+  measuredFps: number;
   framesWritten: number;
-  /** Frames the camera dropped because the pipeline was late. */
+  /** Frames the camera dropped (any reason). */
   captureDroppedFrames: number;
+  /** ...of which: the pipeline was late. */
+  droppedLateFrames: number;
+  /** ...of which: the camera ran out of frame buffers. */
+  droppedOutOfBuffersFrames: number;
   /** Frames dropped because the encoder was not ready. */
   writerDroppedFrames: number;
-  /** Frames missing according to the timestamps (gaps longer than 1.5 frame durations). */
+  /** Frames missing according to the timestamps (intervals longer than 1.5 frame durations). */
   missingFrames: number;
+  /** Frames rejected because their timestamp went backwards. */
+  outOfOrderFrames: number;
   /** Capture pauses (interruptions or timestamp jumps over 0.5 s). */
   gaps: number;
-  /** Consecutive segments whose start did not equal the previous end (should stay 0). */
-  discontinuities: number;
+  /** Consecutive segments with time missing between them that no pause explains (should stay 0). */
+  segmentGaps: number;
+  /** Consecutive segments that overlap in time (should stay 0). */
+  segmentOverlaps: number;
+  /** Segment index order disagreeing with timestamp order (should stay 0). */
+  orderingErrors: number;
   failedSegments: number;
+  /** Segments deleted by retention since the buffer started. */
+  expiredSegments: number;
+  /** Unknown finalized files found in the buffer folder and deleted. */
+  orphansRemoved: number;
+  /** Segments currently protected from deletion. */
+  protectedSegments: number;
+  /** Expired segments kept only because they are protected. */
+  retiredSegments: number;
   /** Newest kept segment. */
   lastSegment?: BufferSegment;
+};
+
+/** Replay lengths accepted by saveReplay(), seconds. */
+export const REPLAY_DURATIONS = [10, 15, 20, 30, 60, 120] as const;
+export type ReplayDuration = (typeof REPLAY_DURATIONS)[number];
+export const DEFAULT_REPLAY_DURATION: ReplayDuration = 20;
+
+export type ReplayInfo = {
+  /** file:// URI in the app's Documents/Replays folder (Files app: On My iPhone → Tripod → Replays). */
+  uri: string;
+  fileName: string;
+  /** Duration of the saved file. */
+  durationSeconds: number;
+  requestedSeconds: number;
+  /** Footage selected from the buffer (shorter than requested if the buffer was younger). */
+  plannedSeconds: number;
+  sizeBytes: number;
+  width: number;
+  height: number;
+  codec: string;
+  /** ISO 8601: the press, and the wall-clock span the replay covers. */
+  pressedAt: string;
+  startedAt: string;
+  endedAt: string;
+  /** Buffer segments the replay was assembled from. */
+  segmentCount: number;
+  /** How long the export took. */
+  exportSeconds: number;
+  /** Less footage than requested, capture pauses inside the window, or skipped segments. */
+  note?: string;
 };
 
 type TripodCameraEvents = {
@@ -141,6 +201,7 @@ declare class TripodCameraNativeModule extends NativeModule<TripodCameraEvents> 
   stopBuffer(): Promise<BufferStatus>;
   getBufferStatus(): Promise<BufferStatus>;
   getBufferSegments(): Promise<BufferSegment[]>;
+  saveReplay(seconds: number): Promise<ReplayInfo>;
 }
 
 // Optional: the module is absent in Expo Go, on web and on Android, where the app
@@ -204,6 +265,16 @@ export async function getBufferStatus(): Promise<BufferStatus> {
 export async function getBufferSegments(): Promise<BufferSegment[]> {
   if (!CameraModule) throw unavailable();
   return CameraModule.getBufferSegments();
+}
+
+/**
+ * Saves the previous `seconds` of buffered footage as one MP4, up to the moment of the call,
+ * while the camera keeps recording. Calls queue and export one at a time. Rejects with
+ * ERR_BUFFER_NOT_STARTED, ERR_NO_FOOTAGE, ERR_EXPORT_FAILED, ERR_VERIFY_FAILED, ...
+ */
+export async function saveReplay(seconds: ReplayDuration): Promise<ReplayInfo> {
+  if (!CameraModule) throw unavailable();
+  return CameraModule.saveReplay(seconds);
 }
 
 /** Buffer diagnostics on every state change and every finished segment (about every 5 s). */

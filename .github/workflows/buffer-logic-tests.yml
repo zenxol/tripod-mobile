@@ -1,0 +1,33 @@
+# Runs the rolling buffer's pure-Swift logic tests (SegmentStore: expiry, ordering,
+# protection, continuity; ReplayPlanning: replay window, file names, export cleanup, job
+# order). Linux + the official Swift image: fast and cheap (macOS minutes cost 10x). The iOS
+# build workflow runs the same tests before compiling the app.
+name: Buffer logic tests
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'modules/tripod-camera/ios/SegmentStore.swift'
+      - 'modules/tripod-camera/ios/ReplayPlanning.swift'
+      - 'modules/tripod-camera/tests/**'
+      - '.github/workflows/buffer-logic-tests.yml'
+
+jobs:
+  segment-store:
+    runs-on: ubuntu-latest
+    container: swift:6.1
+    timeout-minutes: 10
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Compile and run SegmentStore tests
+        run: |
+          swift --version
+          swiftc -swift-version 5 \
+            modules/tripod-camera/ios/SegmentStore.swift \
+            modules/tripod-camera/ios/ReplayPlanning.swift \
+            modules/tripod-camera/tests/SegmentStoreTests/main.swift \
+            -o /tmp/segment-store-tests
+          /tmp/segment-store-tests

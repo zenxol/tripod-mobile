@@ -157,6 +157,16 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       }
     })
 
+    // Best effort when iOS terminates the app: finish the open segment. Anything left half
+    // written is deleted on the next launch.
+    // (UIApplication.willTerminateNotification by its string value, which keeps UIKit's
+    // main-actor annotations out of this background class.)
+    observers.append(center.addObserver(
+      forName: Notification.Name("UIApplicationWillTerminateNotification"), object: nil, queue: nil
+    ) { [weak self] _ in
+      self?.buffer.pause("The app is closing.")
+    })
+
     buffer.setFailureHandler { [weak self] _ in
       guard let self else { return }
       // The recorder already stopped itself; put the movie output back.
@@ -167,6 +177,8 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
       try? FileManager.default.removeItem(at: Self.inProgressDirectory)
       // Buffer footage from a previous launch is stale (or a crash leftover).
       try? FileManager.default.removeItem(at: RollingBufferRecorder.directory)
+      // Partial replay exports from a crash; finished replays live in Documents/Replays.
+      try? FileManager.default.removeItem(at: ReplaySaver.workDirectory)
     }
   }
 
@@ -283,8 +295,10 @@ final class CameraSessionController: NSObject, AVCaptureFileOutputRecordingDeleg
   func startBuffer(_ completion: @escaping RecordingCompletion) {
     queue.async { [self] in
       guard bufferMode == .off else {
-        return completion(.failure(RecordingError(
-          code: "ERR_BUFFER_ACTIVE", message: "The replay buffer is already running.")))
+        let message = bufferMode == .stopping
+          ? "The replay buffer is still stopping. Try again in a moment."
+          : "The replay buffer is already running."
+        return completion(.failure(RecordingError(code: "ERR_BUFFER_ACTIVE", message: message)))
       }
       guard active == nil else {
         return completion(.failure(RecordingError(

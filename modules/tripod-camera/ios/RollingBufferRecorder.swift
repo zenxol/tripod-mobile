@@ -29,34 +29,21 @@ enum BufferState: String {
   case error
 }
 
-/// A finished, playable segment file in the rolling buffer.
-struct BufferSegment {
-  let index: Int
-  let url: URL
-  /// Capture-clock timestamps (seconds) of the first frame and of the segment's end.
-  let startTime: CMTime
-  let endTime: CMTime
-  let startedAt: Date
-  let endedAt: Date
-  let frameCount: Int
-  let sizeBytes: Int64
-  /// True when capture stopped (interruption, gap) before this segment, so it does not continue the previous one.
-  let followsGap: Bool
-
-  var duration: Double { (endTime - startTime).seconds }
-
+extension BufferSegment {
   func dictionary() -> [String: Any] {
     [
       "index": index,
-      "fileName": url.lastPathComponent,
-      "uri": url.absoluteString,
-      "startTime": startTime.seconds,
-      "endTime": endTime.seconds,
+      "fileName": fileName,
+      "uri": RollingBufferRecorder.directory.appendingPathComponent(fileName).absoluteString,
+      "startTime": startTime,
+      "endTime": endTime,
       "durationSeconds": RollingBufferRecorder.round(duration, places: 3),
       "startedAt": RollingBufferRecorder.isoFormatter.string(from: startedAt),
       "endedAt": RollingBufferRecorder.isoFormatter.string(from: endedAt),
       "frameCount": frameCount,
-      "fps": RollingBufferRecorder.round(duration > 0 ? Double(frameCount) / duration : 0, places: 2),
+      "fps": RollingBufferRecorder.round(measuredFps, places: 2),
+      "missingFrames": missingFrames,
+      "maxFrameIntervalMs": RollingBufferRecorder.round(maxFrameInterval * 1000, places: 1),
       "sizeBytes": Double(sizeBytes),
       "followsGap": followsGap,
     ]
@@ -69,20 +56,26 @@ struct BufferSegment {
  Pipeline: AVCaptureVideoDataOutput delivers each camera frame (as captured, no conversion)
  on `videoQueue`; it is appended immediately to the open segment's AVAssetWriter, which
  encodes it in hardware (HEVC, else H.264). No frames are kept in memory beyond what the
- encoder holds for a moment.
+ encoder holds for a moment. The capture session is never stopped or reconfigured to rotate.
 
- Rotation without gaps: the segment closes at the first frame whose timestamp is at least
+ Rotation: the segment closes at the first frame whose presentation timestamp is at least
  `segmentSeconds` after the segment's first frame. That frame becomes the first frame of the
- next segment, and the old segment ends exactly at its timestamp, so the timeline continues
- with no lost frames. The next writer is created and started on `prepQueue` in advance, so
- switching costs almost nothing on the capture queue.
+ next segment, and the old segment ends exactly at its timestamp. The next writer is created
+ and started on `prepQueue` in advance, so switching costs almost nothing on the capture queue.
+
+ Measurement: all timing comes from sample presentation timestamps. Frames missing inside the
+ stream (intervals > 1.5 frame durations), camera drops (with their reason), encoder drops,
+ out-of-order frames, gaps and overlaps between segments, and failed segments are counted,
+ logged and reported in the status.
 
  Files: `tmp/rolling-buffer/writing_NNNNNN.mov` while open, renamed to `segment_NNNNNN.mov`
- only after `finishWriting` succeeds. Segments beyond `retentionSeconds + safetyMarginSeconds`
- of footage are deleted, oldest first. The folder is emptied on every start and on launch.
+ only after `finishWriting` succeeds. `SegmentStore` decides what expires; only finalized,
+ unprotected segments are ever deleted. Indexes keep increasing for the whole app session, so
+ a protected file from an earlier run can never collide with a new one.
 
  Threads: `videoQueue` owns the writers and frame state; `storeQueue` renames, measures and
- deletes files; `prepQueue` builds writers. The status model is shared under `lock`.
+ deletes files; `prepQueue` builds writers; `eventQueue` delivers status events in order. The
+ shared model is guarded by `lock`.
  */
 final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
   static let segmentSeconds: Double = 5
@@ -92,6 +85,13 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
   static let minFreeBytesWhileBuffering: Int64 = 300 * 1024 * 1024
   /// A jump in frame timestamps longer than this is treated as a capture gap, not dropped frames.
   static let gapThresholdSeconds: Double = 0.5
+  /// Stop gives up waiting for a segment that never finishes (so the UI can't hang).
+  static let stopTimeoutSeconds: Double = 10
+  /// A summary line is logged every this many segments (30 s).
+  static let summaryEverySegments = 6
+  /// A replay cut waits at most this long for a frame after the press before closing the
+  /// segment at its last frame (only if capture stalls).
+  static let cutTimeoutSeconds: Double = 0.5
 
   static var directory: URL {
     FileManager.default.temporaryDirectory.appendingPathComponent("rolling-buffer", isDirectory: true)
@@ -109,12 +109,14 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
   let videoQueue = DispatchQueue(label: "com.zenxol.tripod.buffer.video", qos: .userInitiated)
   private let prepQueue = DispatchQueue(label: "com.zenxol.tripod.buffer.prepare", qos: .userInitiated)
   private let storeQueue = DispatchQueue(label: "com.zenxol.tripod.buffer.store", qos: .utility)
+  private let eventQueue = DispatchQueue(label: "com.zenxol.tripod.buffer.events", qos: .utility)
   private let pendingFinishes = DispatchGroup()
 
   // videoQueue only.
   private var config: BufferConfiguration?
   private var isAccepting = false
   private var generation = 0
+  /// Never reset while the app runs (file names stay unique across buffer runs).
   private var nextIndex = 1
   private var current: OpenSegment?
   private var prepared: PreparedWriter?
@@ -122,10 +124,21 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
   private var lastPTS: CMTime?
   private var nominalFrameDuration = CMTime(value: 1, timescale: 60)
   private var nextSegmentFollowsGap = false
+  /// Replay requests waiting for the open segment to be cut after their endpoint.
+  private var cutWaiters: [CutWaiter] = []
+  private var nextWaiterID = 0
+
+  private struct CutWaiter {
+    let id: Int
+    let endpoint: CMTime
+    let resume: () -> Void
+  }
 
   // Shared; guarded by `lock`.
   private let lock = NSLock()
   private var model = Model()
+  /// The capture session's clock (sample timestamps' time base), set when the buffer first starts.
+  private var captureClock: CMClock?
   private var statusHandler: (([String: Any]) -> Void)?
   private var failureHandler: ((RecordingError) -> Void)?
 
@@ -133,15 +146,23 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     var generation = 0
     var state: BufferState = .idle
     var message: String?
-    var segments: [BufferSegment] = []
-    var storageBytes: Int64 = 0
+    var store = SegmentStore(
+      keepSeconds: RollingBufferRecorder.retentionSeconds + RollingBufferRecorder.safetyMarginSeconds)
     var framesWritten = 0
     var captureDroppedFrames = 0
+    var droppedLate = 0
+    var droppedOutOfBuffers = 0
+    var droppedOther = 0
     var writerDroppedFrames = 0
     var missingFrames = 0
+    var outOfOrderFrames = 0
     var gaps = 0
-    var discontinuities = 0
     var failedSegments = 0
+    var orphansRemoved = 0
+    var diskBytes: Int64 = 0
+    var fileCount = 0
+    var memoryBytes: Int64 = 0
+    var segmentsSinceSummary = 0
     var codec = "none"
     var width = 0
     var height = 0
@@ -173,6 +194,8 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     let followsGap: Bool
     var lastTime: CMTime
     var frameCount = 0
+    var missingFrames = 0
+    var maxFrameInterval: Double = 0
 
     init(writer: PreparedWriter, startTime: CMTime, startedAt: Date, followsGap: Bool) {
       self.writer = writer
@@ -185,7 +208,7 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
 
   // MARK: - Public API (any thread)
 
-  /// Receives the status dictionary on every state change and finished segment.
+  /// Receives the status dictionary on every state change and finished segment, in order.
   func setStatusHandler(_ handler: (([String: Any]) -> Void)?) {
     lock.lock()
     statusHandler = handler
@@ -204,27 +227,157 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
   }
 
   func currentSegments() -> [[String: Any]] {
-    withModel { $0.segments }.map { $0.dictionary() }
+    withModel { $0.store.segments }.map { $0.dictionary() }
   }
 
-  /// Clears the previous buffer and starts accepting frames. Completes on `videoQueue`.
+  /// Protects the finalized segments overlapping [start, end) (capture-clock seconds, as in the
+  /// segment metadata) from deletion until `releaseSegments` is called. For future replay/export.
+  func protectSegments(from start: Double, to end: Double) -> SegmentLease? {
+    let lease = withModel { $0.store.protect(from: start, to: end) }
+    if let lease {
+      Self.log.info("Protected segments \(lease.segmentIndexes.description, privacy: .public) (lease \(lease.id))")
+      emitStatus()
+    }
+    return lease
+  }
+
+  /// Ends a protection. Segments that expired meanwhile are deleted now.
+  func releaseSegments(_ lease: SegmentLease) {
+    let files = withModel { $0.store.release(lease) }
+    storeQueue.async { [self] in
+      Self.deleteFiles(files)
+      Self.log.info("Released lease \(lease.id); deleted \(files.count) expired segment(s)")
+      refreshDiskUsage()
+      emitStatus()
+    }
+  }
+
+  // MARK: - Replay reservation
+
+  /// What a replay export needs: the trimmed footage plan and the protection that keeps its
+  /// files alive. The caller must `releaseSegments(lease)` when done.
+  struct ReplayReservation {
+    let plan: ReplayPlan
+    let lease: SegmentLease
+    /// Wall-clock times of the replay's first and last instant.
+    let startedAt: Date
+    let endedAt: Date
+  }
+
+  /// "Now" on the frames' own timeline (the capture session clock). Read at the moment of a
+  /// Save Replay press. Nil before the buffer has ever started.
+  func captureNow() -> CMTime? {
+    guard let clock = withLock({ captureClock }) else { return nil }
+    return CMClockGetTime(clock)
+  }
+
+  /// Makes all footage up to `endpoint` final without pausing capture, then selects and
+  /// protects the replay window [endpoint - seconds, endpoint). Completes on a background queue.
+  ///
+  /// The open segment is cut at the first frame after `endpoint` (normally within one frame
+  /// time); that frame starts the next segment, so the timeline stays continuous. If the buffer
+  /// is not live (stopped, paused, error), the window ends at the last recorded frame instead.
+  func reserveReplay(
+    endpoint: CMTime, seconds: Double, completion: @escaping (Result<ReplayReservation, ReplayError>) -> Void
+  ) {
+    videoQueue.async { [self] in
+      let isLive = isAccepting && current != nil
+      let reserve: () -> Void = { [self] in
+        // Wait for the cut segment (and any other finishing segment) to be finalized.
+        waitForPendingFinishes { [self] _ in
+          completion(makeReservation(endpoint: endpoint.seconds, seconds: seconds, isLive: isLive))
+        }
+      }
+      guard isLive, let segment = current, segment.startTime < endpoint else {
+        reserve()
+        return
+      }
+      let id = nextWaiterID
+      nextWaiterID += 1
+      cutWaiters.append(CutWaiter(id: id, endpoint: endpoint, resume: reserve))
+      // Safety net if capture stalls right after the press: close the segment at its last frame.
+      videoQueue.asyncAfter(deadline: .now() + Self.cutTimeoutSeconds) { [self] in
+        guard cutWaiters.contains(where: { $0.id == id }) else { return }
+        Self.log.notice("Replay cut: no frame within \(Self.cutTimeoutSeconds) s of the press; closing the segment at its last frame")
+        if let open = current {
+          finish(open, endTime: open.lastTime + nominalFrameDuration, keepAlive: false)
+          current = nil
+        }
+        resumeCutWaiters(before: nil)
+      }
+    }
+  }
+
+  /// Resumes the replay requests whose endpoint is before `pts` (all of them if nil).
+  /// videoQueue only; call after the segment containing those endpoints was finished.
+  private func resumeCutWaiters(before pts: CMTime?) {
+    guard !cutWaiters.isEmpty else { return }
+    var ready: [CutWaiter] = []
+    var waiting: [CutWaiter] = []
+    for waiter in cutWaiters {
+      if let pts, waiter.endpoint >= pts {
+        waiting.append(waiter)
+      } else {
+        ready.append(waiter)
+      }
+    }
+    cutWaiters = waiting
+    ready.forEach { $0.resume() }
+  }
+
+  /// storeQueue. Selects the window from finalized segments and protects it atomically (under
+  /// the lock, so retention can't delete anything in between).
+  private func makeReservation(endpoint: Double, seconds: Double, isLive: Bool) -> Result<ReplayReservation, ReplayError> {
+    withModel { (model: inout Model) -> Result<ReplayReservation, ReplayError> in
+      let segments = model.store.segments
+      guard let last = segments.last else {
+        return .failure(ReplayError(code: "ERR_NO_FOOTAGE", message: "Nothing has been buffered yet."))
+      }
+      let end = isLive ? endpoint : min(endpoint, last.endTime)
+      guard let plan = ReplayPlanner.plan(segments: segments, endpoint: end, requestedSeconds: seconds) else {
+        return .failure(ReplayError(
+          code: "ERR_NO_FOOTAGE", message: "No buffered footage in the last \(Int(seconds)) seconds."))
+      }
+      guard let lease = model.store.protect(indexes: plan.segmentIndexes) else {
+        return .failure(ReplayError(code: "ERR_NO_FOOTAGE", message: "The buffered footage is no longer available."))
+      }
+      let byIndex = Dictionary(uniqueKeysWithValues: segments.map { ($0.index, $0) })
+      let first = plan.pieces[0]
+      let lastPiece = plan.pieces[plan.pieces.count - 1]
+      let startedAt = byIndex[first.segmentIndex].map { $0.startedAt.addingTimeInterval(first.fileOffset) } ?? Date()
+      let endedAt = byIndex[lastPiece.segmentIndex].map {
+        $0.startedAt.addingTimeInterval(lastPiece.fileOffset + lastPiece.duration)
+      } ?? Date()
+      return .success(ReplayReservation(plan: plan, lease: lease, startedAt: startedAt, endedAt: endedAt))
+    }
+  }
+
+  /// Starts a new buffer run and accepts frames. Completes on `videoQueue`.
   func start(_ config: BufferConfiguration, completion: @escaping (Result<[String: Any], RecordingError>) -> Void) {
     videoQueue.async { [self] in
       guard !isAccepting else {
         return completion(.failure(RecordingError(
-          code: "ERR_BUFFER_ACTIVE", message: "The rolling buffer is already running.")))
+          code: "ERR_BUFFER_ACTIVE", message: "The replay buffer is already running.")))
       }
       generation += 1
       let runGeneration = generation
-      withModel {
-        $0 = Model()
-        $0.generation = runGeneration
-        $0.state = .starting
-        $0.codec = config.codec
-        $0.width = config.displayWidth
-        $0.height = config.displayHeight
-        $0.fps = config.fps
+
+      // Previous run's segments expire; protected ones stay until released.
+      let expiredFiles = withModel { (model: inout Model) -> [String] in
+        let files = model.store.reset()
+        var fresh = Model()
+        fresh.store = model.store
+        fresh.orphansRemoved = model.orphansRemoved
+        fresh.generation = runGeneration
+        fresh.state = .starting
+        fresh.codec = config.codec
+        fresh.width = config.displayWidth
+        fresh.height = config.displayHeight
+        fresh.fps = config.fps
+        model = fresh
+        return files
       }
+      Self.deleteFiles(expiredFiles)
 
       let keepSeconds = Self.retentionSeconds + Self.safetyMarginSeconds + Self.segmentSeconds
       let neededBytes = Int64(config.estimatedBytesPerSecond * keepSeconds) + Self.minFreeBytesWhileBuffering
@@ -236,15 +389,18 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
       }
 
       do {
-        try Self.resetDirectory()
+        try FileManager.default.createDirectory(at: Self.directory, withIntermediateDirectories: true)
       } catch {
         return failStart(RecordingError(
           code: "ERR_FILE", message: "Could not prepare the buffer folder: \(error.localizedDescription)"), completion)
       }
+      // Nothing is being written now: anything not protected is a leftover.
+      let retained = withModel { $0.store.retainedFileNames }
+      Self.removeFiles(notIn: retained)
 
       self.config = config
+      withLock { captureClock = config.clock }
       nominalFrameDuration = Self.frameDuration(fps: config.fps)
-      nextIndex = 1
       lastPTS = nil
       current = nil
       isPreparing = false
@@ -260,36 +416,44 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
       }
 
       isAccepting = true
-      Self.log.info("Buffer started: \(config.codec, privacy: .public) \(config.displayWidth)x\(config.displayHeight) @ \(config.fps) fps, \(Self.segmentSeconds) s segments")
-      emitStatus()
+      Self.log.info("Buffer started: \(config.codec, privacy: .public) \(config.displayWidth)x\(config.displayHeight) @ \(config.fps) fps, \(Self.segmentSeconds) s segments, keeping \(Self.retentionSeconds + Self.safetyMarginSeconds) s")
+      storeQueue.async { [self] in
+        refreshDiskUsage()
+        emitStatus()
+      }
       completion(.success(currentStatus()))
     }
   }
 
-  /// Finishes the open segment, waits for every pending file, then completes with the final status.
-  /// Finished segments stay on disk until the next start (or app launch). Safe to call repeatedly.
+  /// Finishes the open segment, waits (up to `stopTimeoutSeconds`) for every pending file, then
+  /// completes with the final status. Finished segments stay on disk until the next start (or
+  /// app launch). Safe to call repeatedly or while not running.
   func stop(_ completion: @escaping ([String: Any]) -> Void) {
     videoQueue.async { [self] in
       if isAccepting {
         setState(.stopping, nil)
         stopAccepting(keepAlive: true)
       }
-      pendingFinishes.notify(queue: storeQueue) { [self] in
+      waitForPendingFinishes { [self] timedOut in
         withModel {
           if $0.state != .error {
             $0.state = .idle
-            $0.message = nil
+            $0.message = timedOut ? "A segment did not finish writing in time; it was skipped." : nil
           }
         }
-        Self.log.info("Buffer stopped")
+        if timedOut {
+          Self.log.error("Buffer stop: a segment did not finish within \(Self.stopTimeoutSeconds) s")
+        }
+        refreshDiskUsage()
+        logSummary(reason: "stopped")
         emitStatus()
         completion(currentStatus())
       }
     }
   }
 
-  /// Capture is interrupted: finish the open segment so it is kept. Buffering resumes by itself
-  /// with a new segment when frames arrive again.
+  /// Capture is interrupted (or the app is closing): finish the open segment so it is kept.
+  /// Buffering resumes by itself with a new segment when frames arrive again.
   func pause(_ reason: String) {
     videoQueue.async { [self] in
       guard isAccepting else { return }
@@ -297,6 +461,8 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
         finish(segment, endTime: segment.lastTime + nominalFrameDuration, keepAlive: true)
         current = nil
       }
+      // Replay requests get the footage up to the pause.
+      resumeCutWaiters(before: nil)
       if lastPTS != nil {
         withModel { $0.gaps += 1 }
       }
@@ -325,7 +491,10 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
 
     if let last = lastPTS {
       // Never write out of order (AVAssetWriter would fail the whole segment).
-      guard pts > last else { return }
+      guard pts > last else {
+        withModel { $0.outOfOrderFrames += 1 }
+        return
+      }
       let delta = (pts - last).seconds
       if delta > Self.gapThresholdSeconds {
         // Capture stopped and resumed without an interruption notice: close the segment at
@@ -334,13 +503,16 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
           finish(segment, endTime: segment.lastTime + nominalFrameDuration, keepAlive: false)
           current = nil
         }
+        resumeCutWaiters(before: pts)
         nextSegmentFollowsGap = true
         withModel { $0.gaps += 1 }
         Self.log.notice("Buffer: \(delta) s gap in frame timestamps")
       } else {
+        current?.maxFrameInterval = max(current?.maxFrameInterval ?? 0, delta)
         let nominal = nominalFrameDuration.seconds
         if nominal > 0, delta > nominal * 1.5 {
           let missing = max(Int((delta / nominal).rounded()) - 1, 1)
+          current?.missingFrames += missing
           withModel { $0.missingFrames += missing }
         }
       }
@@ -348,16 +520,29 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     lastPTS = pts
 
     // Rotate on actual timestamps: this frame starts the next segment, and the old one ends
-    // exactly where it begins.
-    if let segment = current, (pts - segment.startTime).seconds >= Self.segmentSeconds {
+    // exactly where it begins. The session keeps running; no frame is skipped. A Save Replay
+    // press forces the same rotation at the first frame after its endpoint ("cut"), so the
+    // footage up to the press is finalized without waiting for the 5-second boundary.
+    let cutDue = cutWaiters.contains { $0.endpoint < pts }
+    if let segment = current, cutDue || (pts - segment.startTime).seconds >= Self.segmentSeconds {
       finish(segment, endTime: pts, keepAlive: false)
       current = nil
+    }
+    if cutDue {
+      resumeCutWaiters(before: pts)
     }
     if current == nil {
       guard openSegment(at: pts) else { return }
     }
     guard let segment = current else { return }
 
+    let writer = segment.writer.writer
+    guard writer.status == .writing else {
+      // Appending to a failed writer raises an exception; stop cleanly instead.
+      let reason = writer.error?.localizedDescription ?? "writer status \(writer.status.rawValue)"
+      fail(RecordingError(code: "ERR_BUFFER_WRITE", message: "The video encoder stopped: \(reason)"))
+      return
+    }
     let input = segment.writer.input
     guard input.isReadyForMoreMediaData else {
       withModel { $0.writerDroppedFrames += 1 }
@@ -368,33 +553,50 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
       segment.lastTime = pts
       withModel { $0.framesWritten += 1 }
     } else {
-      let reason = segment.writer.writer.error?.localizedDescription ?? "unknown error"
+      let reason = writer.error?.localizedDescription ?? "unknown error"
       fail(RecordingError(code: "ERR_BUFFER_WRITE", message: "Writing a buffer segment failed: \(reason)"))
     }
   }
 
   func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
     guard isAccepting else { return }
-    withModel { $0.captureDroppedFrames += 1 }
+    let reason = CMGetAttachment(
+      sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil) as? String
+    withModel {
+      $0.captureDroppedFrames += 1
+      if reason == (kCMSampleBufferDroppedFrameReason_FrameWasLate as String) {
+        $0.droppedLate += 1
+      } else if reason == (kCMSampleBufferDroppedFrameReason_OutOfBuffers as String) {
+        $0.droppedOutOfBuffers += 1
+      } else {
+        $0.droppedOther += 1
+      }
+    }
   }
 
   // MARK: - Segments (videoQueue)
 
   private func openSegment(at pts: CMTime) -> Bool {
     guard let config else { return false }
-    var writer = prepared
+    var candidate = prepared
     prepared = nil
-    if writer == nil {
+    if let waiting = candidate, waiting.writer.status != .writing {
+      // The prepared writer failed while waiting (e.g. media services reset).
+      Self.log.error("Buffer: prepared writer \(waiting.index) is no longer usable; creating a new one")
+      Self.discard(waiting)
+      candidate = nil
+    }
+    if candidate == nil {
       Self.log.notice("Buffer: next writer was not ready; creating it on the capture queue")
       do {
-        writer = try Self.makeWriter(index: nextIndex, generation: generation, config: config)
+        candidate = try Self.makeWriter(index: nextIndex, generation: generation, config: config)
         nextIndex += 1
       } catch {
         fail(Self.recordingError(error))
         return false
       }
     }
-    guard let writer else { return false }
+    guard let writer = candidate else { return false }
 
     writer.writer.startSession(atSourceTime: pts)
     current = OpenSegment(
@@ -441,11 +643,21 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
   /// `keepAlive` asks iOS for time to finish the file when the app may be leaving the foreground.
   private func finish(_ segment: OpenSegment, endTime: CMTime, keepAlive: Bool) {
     let prepared = segment.writer
+    let writer = prepared.writer
     guard segment.frameCount > 0, let config else {
       Self.discard(prepared)
       return
     }
-    prepared.writer.endSession(atSourceTime: endTime)
+    guard writer.status == .writing else {
+      // endSession/finishWriting on a failed writer raise exceptions: count it and clean up.
+      let reason = writer.error?.localizedDescription ?? "writer status \(writer.status.rawValue)"
+      Self.log.error("Buffer segment \(prepared.index) failed before finishing: \(reason, privacy: .public)")
+      Self.discard(prepared)
+      withModel { $0.failedSegments += 1 }
+      emitStatus()
+      return
+    }
+    writer.endSession(atSourceTime: endTime)
     prepared.input.markAsFinished()
 
     let record = PendingSegment(
@@ -458,18 +670,19 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
       startedAt: segment.startedAt,
       endedAt: Self.wallClock(for: endTime, clock: config.clock),
       frameCount: segment.frameCount,
-      followsGap: segment.followsGap)
+      followsGap: segment.followsGap,
+      missingFrames: segment.missingFrames,
+      maxFrameInterval: segment.maxFrameInterval)
 
     pendingFinishes.enter()
     let finished = DispatchSemaphore(value: 0)
     if keepAlive {
       ProcessInfo.processInfo.performExpiringActivity(withReason: "Finishing a replay buffer segment") { expired in
         if !expired {
-          _ = finished.wait(timeout: .now() + 10)
+          _ = finished.wait(timeout: .now() + Self.stopTimeoutSeconds)
         }
       }
     }
-    let writer = prepared.writer
     writer.finishWriting { [self] in
       let succeeded = writer.status == .completed
       let reason = writer.error?.localizedDescription
@@ -487,6 +700,7 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
       finish(segment, endTime: segment.lastTime + nominalFrameDuration, keepAlive: keepAlive)
     }
     current = nil
+    resumeCutWaiters(before: nil)
     if let writer = prepared {
       Self.discard(writer)
     }
@@ -500,7 +714,7 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     stopAccepting(keepAlive: true)
     setState(.error, error.message)
     let handler = withLock { failureHandler }
-    pendingFinishes.notify(queue: storeQueue) {
+    waitForPendingFinishes { _ in
       handler?(error)
     }
   }
@@ -511,6 +725,18 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     Self.log.error("Buffer could not start: \(error.code, privacy: .public) \(error.message, privacy: .public)")
     setState(.error, error.message)
     completion(.failure(error))
+  }
+
+  /// Runs `then` on `storeQueue` once every segment being finished is done, or after the timeout.
+  private func waitForPendingFinishes(_ then: @escaping (Bool) -> Void) {
+    let group = pendingFinishes
+    // Wait off storeQueue: the finish completions themselves run there.
+    DispatchQueue.global(qos: .utility).async { [self] in
+      let timedOut = group.wait(timeout: .now() + Self.stopTimeoutSeconds) == .timedOut
+      storeQueue.async {
+        then(timedOut)
+      }
+    }
   }
 
   // MARK: - Files (storeQueue)
@@ -526,6 +752,8 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     let endedAt: Date
     let frameCount: Int
     let followsGap: Bool
+    let missingFrames: Int
+    let maxFrameInterval: Double
   }
 
   private func complete(_ record: PendingSegment, succeeded: Bool, reason: String?) {
@@ -557,53 +785,102 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
     let segment = BufferSegment(
       index: record.index,
-      url: record.finalURL,
-      startTime: record.startTime,
-      endTime: record.endTime,
+      fileName: record.finalURL.lastPathComponent,
+      startTime: record.startTime.seconds,
+      endTime: record.endTime.seconds,
       startedAt: record.startedAt,
       endedAt: record.endedAt,
       frameCount: record.frameCount,
       sizeBytes: size,
-      followsGap: record.followsGap)
+      followsGap: record.followsGap,
+      missingFrames: record.missingFrames,
+      maxFrameInterval: record.maxFrameInterval)
 
-    let keepSeconds = Self.retentionSeconds + Self.safetyMarginSeconds
-    let (expired, discontinuous) = withModel { (model: inout Model) -> ([BufferSegment], Bool) in
-      let position = model.segments.firstIndex(where: { $0.index > segment.index }) ?? model.segments.endIndex
-      // Continuity check on real timestamps: a segment that does not follow a known gap must
-      // start exactly where the previous one ended.
-      var isDiscontinuous = false
-      if position > 0, !segment.followsGap {
-        let previous = model.segments[position - 1]
-        if previous.index == segment.index - 1, abs((segment.startTime - previous.endTime).seconds) > 0.001 {
-          isDiscontinuous = true
-          model.discontinuities += 1
-        }
+    let (result, summaryDue) = withModel { (model: inout Model) -> (SegmentInsertResult, Bool) in
+      let result = model.store.insert(segment)
+      model.segmentsSinceSummary += 1
+      let due = model.segmentsSinceSummary >= Self.summaryEverySegments
+      if due {
+        model.segmentsSinceSummary = 0
       }
-      model.segments.insert(segment, at: position)
-      model.storageBytes += segment.sizeBytes
-
-      // Keep about the newest `keepSeconds` of footage: drop the oldest segment while the
-      // rest still covers it.
-      var total = model.segments.reduce(0.0) { $0 + $1.duration }
-      var removed: [BufferSegment] = []
-      while model.segments.count > 1, total - model.segments[0].duration >= keepSeconds {
-        let oldest = model.segments.removeFirst()
-        total -= oldest.duration
-        model.storageBytes -= oldest.sizeBytes
-        removed.append(oldest)
-      }
-      return (removed, isDiscontinuous)
+      return (result, due)
     }
-    for old in expired {
-      try? fileManager.removeItem(at: old.url)
+    guard result.accepted else {
+      Self.log.error("Buffer segment \(segment.index) was reported twice; ignored")
+      return
+    }
+    // Only finalized, expired, unprotected segments reach this list.
+    Self.deleteFiles(result.filesToDelete)
+
+    Self.log.info("Segment \(segment.index): \(segment.duration) s, \(segment.frameCount) frames, \(segment.measuredFps) fps, \(segment.missingFrames) missing, max interval \(segment.maxFrameInterval * 1000) ms, \(segment.sizeBytes) bytes; expired \(result.filesToDelete.count)")
+    switch result.continuity {
+    case .unexpectedGap(let seconds):
+      Self.log.error("Segment \(segment.index) starts \(seconds * 1000) ms after the previous segment ended (unexpected gap)")
+    case .overlap(let seconds):
+      Self.log.error("Segment \(segment.index) overlaps the previous segment by \(seconds * 1000) ms")
+    case .expectedGap(let seconds):
+      Self.log.notice("Segment \(segment.index) resumes after a \(seconds) s capture pause")
+    case .continuous, .unknown:
+      break
     }
 
-    let fps = segment.duration > 0 ? Double(segment.frameCount) / segment.duration : 0
-    Self.log.debug("Segment \(segment.index): \(segment.duration) s, \(segment.frameCount) frames (\(fps) fps), \(segment.sizeBytes) bytes; deleted \(expired.count) old")
-    if discontinuous {
-      Self.log.error("Segment \(segment.index) does not start where the previous segment ended")
+    refreshDiskUsage()
+    if summaryDue {
+      logSummary(reason: "periodic")
     }
     emitStatus()
+  }
+
+  /// Measures the folder, removes orphaned finalized files, and samples app memory.
+  /// storeQueue only (the only queue that renames or deletes segment files).
+  private func refreshDiskUsage() {
+    let fileManager = FileManager.default
+    let retained = withModel { $0.store.retainedFileNames }
+    let urls = (try? fileManager.contentsOfDirectory(
+      at: Self.directory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+    var bytes: Int64 = 0
+    var count = 0
+    var removed = 0
+    for url in urls {
+      let name = url.lastPathComponent
+      // A finalized file the store doesn't know: leftover from an earlier run or a failed
+      // rename. Files still being written (writing_*) are never touched here.
+      if name.hasPrefix("segment_"), !retained.contains(name) {
+        try? fileManager.removeItem(at: url)
+        removed += 1
+        continue
+      }
+      let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+      bytes += Int64(size)
+      count += 1
+    }
+    if removed > 0 {
+      Self.log.notice("Removed \(removed) orphaned segment file(s)")
+    }
+    let memory = Self.memoryFootprintBytes()
+    withModel {
+      $0.diskBytes = bytes
+      $0.fileCount = count
+      $0.orphansRemoved += removed
+      if let memory {
+        $0.memoryBytes = memory
+      }
+    }
+  }
+
+  private func logSummary(reason: String) {
+    let m = withModel { $0 }
+    let last = m.store.segments.last
+    Self.log.notice("""
+      Buffer summary (\(reason, privacy: .public)): \(m.state.rawValue, privacy: .public), \
+      \(m.store.segments.count) segments, \(m.store.bufferedSeconds) s buffered, \
+      disk \(m.diskBytes / 1_048_576) MB in \(m.fileCount) files, RAM \(m.memoryBytes / 1_048_576) MB, \
+      last fps \(last?.measuredFps ?? 0), frames \(m.framesWritten), \
+      dropped camera \(m.captureDroppedFrames) (late \(m.droppedLate), buffers \(m.droppedOutOfBuffers)), \
+      dropped encoder \(m.writerDroppedFrames), missing \(m.missingFrames), out of order \(m.outOfOrderFrames), \
+      pauses \(m.gaps), segment gaps \(m.store.unexpectedGaps), overlaps \(m.store.overlaps), \
+      failed \(m.failedSegments), protected \(m.store.protectedSegmentCount)
+      """)
   }
 
   // MARK: - Status
@@ -616,17 +893,25 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     emitStatus()
   }
 
+  /// Snapshots and delivers on one serial queue, so events can't overtake each other and the
+  /// last event always carries the newest state.
   private func emitStatus() {
-    let (handler, model) = withLock { (statusHandler, self.model) }
-    handler?(Self.statusDictionary(model))
+    eventQueue.async { [self] in
+      let (handler, snapshot) = withLock { (statusHandler, model) }
+      handler?(Self.statusDictionary(snapshot))
+    }
   }
 
   private static func statusDictionary(_ model: Model) -> [String: Any] {
+    let store = model.store
     var result: [String: Any] = [
       "state": model.state.rawValue,
-      "segmentCount": model.segments.count,
-      "bufferedSeconds": round(model.segments.reduce(0.0) { $0 + $1.duration }, places: 2),
-      "storageBytes": Double(model.storageBytes),
+      "segmentCount": store.segments.count,
+      "bufferedSeconds": round(store.bufferedSeconds, places: 2),
+      "storageBytes": Double(store.storageBytes),
+      "diskBytes": Double(model.diskBytes),
+      "fileCount": model.fileCount,
+      "memoryBytes": Double(model.memoryBytes),
       "segmentSeconds": segmentSeconds,
       "retentionSeconds": retentionSeconds,
       "safetyMarginSeconds": safetyMarginSeconds,
@@ -634,18 +919,28 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
       "width": model.width,
       "height": model.height,
       "fps": model.fps,
+      "measuredFps": round(store.segments.last?.measuredFps ?? 0, places: 2),
       "framesWritten": model.framesWritten,
       "captureDroppedFrames": model.captureDroppedFrames,
+      "droppedLateFrames": model.droppedLate,
+      "droppedOutOfBuffersFrames": model.droppedOutOfBuffers,
       "writerDroppedFrames": model.writerDroppedFrames,
       "missingFrames": model.missingFrames,
+      "outOfOrderFrames": model.outOfOrderFrames,
       "gaps": model.gaps,
-      "discontinuities": model.discontinuities,
+      "segmentGaps": store.unexpectedGaps,
+      "segmentOverlaps": store.overlaps,
+      "orderingErrors": store.orderingErrors,
       "failedSegments": model.failedSegments,
+      "expiredSegments": store.expiredCount,
+      "orphansRemoved": model.orphansRemoved,
+      "protectedSegments": store.protectedSegmentCount,
+      "retiredSegments": store.retired.count,
     ]
     if let message = model.message {
       result["message"] = message
     }
-    if let last = model.segments.last {
+    if let last = store.segments.last {
       result["lastSegment"] = last.dictionary()
     }
     return result
@@ -711,10 +1006,18 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     try? FileManager.default.removeItem(at: prepared.tempURL)
   }
 
-  private static func resetDirectory() throws {
-    let fileManager = FileManager.default
-    try? fileManager.removeItem(at: directory)
-    try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+  private static func deleteFiles(_ names: [String]) {
+    for name in names {
+      try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
+    }
+  }
+
+  /// Deletes everything in the buffer folder except `keep`. Only call while nothing is being written.
+  private static func removeFiles(notIn keep: Set<String>) {
+    let urls = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+    for url in urls where !keep.contains(url.lastPathComponent) {
+      try? FileManager.default.removeItem(at: url)
+    }
   }
 
   /// Converts a capture timestamp to wall-clock time.
@@ -737,6 +1040,18 @@ final class RollingBufferRecorder: NSObject, AVCaptureVideoDataOutputSampleBuffe
     let values = try? FileManager.default.temporaryDirectory
       .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
     return values?.volumeAvailableCapacityForImportantUsage
+  }
+
+  /// The app's physical memory footprint (what iOS uses for memory limits), or nil if unavailable.
+  private static func memoryFootprintBytes() -> Int64? {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let result = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+      }
+    }
+    return result == KERN_SUCCESS ? Int64(info.phys_footprint) : nil
   }
 
   static func round(_ value: Double, places: Int) -> Double {
